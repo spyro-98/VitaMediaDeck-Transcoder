@@ -13,10 +13,14 @@ import json
 import math
 import os
 import platform
+import queue
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -42,10 +46,52 @@ QUALITY_LIMITS = {
     "balanced": (1_800_000, 5_000_000),
     "high": (2_400_000, 6_000_000),
 }
+PROGRESS_PREFIX = "@@VMD_PROGRESS@@"
+PREFLIGHT_SECONDS = 3.0
+VIDEO_STALL_SECONDS = 30.0
+SYSTEM_LOAD_THREADS = {
+    "low": 2,
+    "balanced": -1,
+    "full": 0,
+}
 
 
 class TranscodeError(RuntimeError):
     pass
+
+
+class AudioDurationError(TranscodeError):
+    pass
+
+
+class VideoPipelineError(TranscodeError):
+    pass
+
+
+class VideoDurationError(VideoPipelineError):
+    pass
+
+
+class VideoProgressError(VideoPipelineError):
+    pass
+
+
+def emit_progress(phase: str, state: str, detail: str = "") -> None:
+    if os.environ.get("VMD_MACHINE_PROGRESS") != "1":
+        return
+    print(
+        PROGRESS_PREFIX
+        + json.dumps(
+            {"phase": phase, "state": state, "detail": detail},
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
+
+
+def announce_phase(number: int, total: int, label: str, phase: str, detail: str = "") -> None:
+    print(f"\n[{number}/{total}] {label}", flush=True)
+    emit_progress(phase, "start", detail)
 
 
 @dataclass(frozen=True)
@@ -64,8 +110,12 @@ class MediaInfo:
     color_primaries: str
     color_space: str
     audio_stream_count: int
+    audio_stream_indices: tuple[int, ...]
     subtitle_codecs: tuple[str, ...]
+    subtitle_stream_indices: tuple[int, ...]
     attachment_count: int
+    cover_stream_index: int | None
+    cover_name: str
     duration: float | None
 
 
@@ -85,6 +135,133 @@ class EncoderPlan:
 
 def command_text(command: Sequence[str]) -> str:
     return shlex.join(str(part) for part in command)
+
+
+def resource_thread_limit(system_load: str) -> int:
+    if system_load == "balanced":
+        detected = os.cpu_count() or 4
+        return max(2, min(8, detected - 2))
+    return SYSTEM_LOAD_THREADS[system_load]
+
+
+def prioritized_command(command: Sequence[str], system_load: str) -> list[str]:
+    """Keep long FFmpeg jobs from starving the desktop session."""
+    result = list(command)
+    if system_load == "full" or os.name == "nt":
+        return result
+    taskpolicy = Path("/usr/sbin/taskpolicy")
+    if platform.system() == "Darwin" and taskpolicy.is_file():
+        qos = "background" if system_load == "low" else "utility"
+        return [str(taskpolicy), "-c", qos, *result]
+    if Path("/usr/bin/nice").is_file():
+        return ["/usr/bin/nice", "-n", "10", *result]
+    return result
+
+
+def process_priority_kwargs(system_load: str) -> dict[str, Any]:
+    if system_load != "full" and os.name == "nt":
+        return {"creationflags": getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)}
+    return {}
+
+
+def run_ffmpeg(command: Sequence[str], system_load: str) -> subprocess.CompletedProcess[Any]:
+    return subprocess.run(
+        prioritized_command(command, system_load),
+        check=False,
+        **process_priority_kwargs(system_load),
+    )
+
+
+def progress_time_seconds(line: str) -> float | None:
+    match = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+    if not match:
+        return None
+    return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+
+
+def run_transcode_guarded(
+    command: Sequence[str],
+    system_load: str,
+    expected_fps: Fraction,
+) -> subprocess.CompletedProcess[Any]:
+    """Stream FFmpeg output and abort only after sustained frame-counter stagnation."""
+    process = subprocess.Popen(
+        prioritized_command(command, system_load),
+        stdout=None,
+        stderr=subprocess.PIPE,
+        **process_priority_kwargs(system_load),
+    )
+    assert process.stderr is not None
+    chunks: queue.Queue[bytes | None] = queue.Queue()
+
+    def read_stderr() -> None:
+        try:
+            while True:
+                reader = getattr(process.stderr, "read1", process.stderr.read)
+                chunk = reader(4096)
+                if not chunk:
+                    break
+                chunks.put(chunk)
+        finally:
+            chunks.put(None)
+
+    reader_thread = threading.Thread(target=read_stderr, daemon=True)
+    reader_thread.start()
+    buffer = ""
+    last_frame_count = -1
+    last_frame_change = time.monotonic()
+    starvation: tuple[int, float, float] | None = None
+    while True:
+        try:
+            raw_chunk = chunks.get(timeout=0.20)
+        except queue.Empty:
+            if process.poll() is not None and not reader_thread.is_alive():
+                break
+            continue
+        if raw_chunk is None:
+            break
+        chunk = raw_chunk.decode(errors="replace")
+        sys.stderr.write(chunk)
+        sys.stderr.flush()
+        buffer += chunk
+        parts = re.split(r"[\r\n]", buffer)
+        buffer = parts.pop()
+        for line in parts:
+            frame_match = re.search(r"(?:^|\s)frame=\s*(\d+)", line)
+            media_seconds = progress_time_seconds(line)
+            if not frame_match or media_seconds is None or media_seconds < 30.0:
+                continue
+            frame_count = int(frame_match.group(1))
+            now = time.monotonic()
+            if frame_count > last_frame_count:
+                last_frame_count = frame_count
+                last_frame_change = now
+                continue
+            stalled_for = now - last_frame_change
+            if stalled_for >= VIDEO_STALL_SECONDS:
+                starvation = (frame_count, media_seconds, stalled_for)
+                break
+        if starvation is not None:
+            break
+    if starvation is not None:
+        process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        reader_thread.join(timeout=0.5)
+        frame_count, media_seconds, stalled_for = starvation
+        expected_by_clock = int(media_seconds * float(expected_fps))
+        raise VideoProgressError(
+            "Video pipeline stalled: the encoded frame counter remained at "
+            f"{frame_count} for {stalled_for:.1f}s while the media clock reached "
+            f"{media_seconds:.1f}s (approximately {expected_by_clock} frames expected by "
+            "that clock). The unsafe attempt was stopped early."
+        )
+    returncode = process.wait()
+    reader_thread.join(timeout=0.5)
+    return subprocess.CompletedProcess(list(command), returncode)
 
 
 def run_capture(command: Sequence[str], description: str) -> str:
@@ -114,6 +291,29 @@ def resolve_tool(value: str, label: str) -> str:
     raise TranscodeError(f"{label} was not found: {value}")
 
 
+def resolve_media_tools(
+    ffmpeg_value: str,
+    ffprobe_value: str,
+) -> tuple[str, str, str]:
+    """Resolve a matched FFmpeg/ffprobe pair, preferring ffmpeg-full on macOS."""
+    use_defaults = ffmpeg_value == "ffmpeg" and ffprobe_value == "ffprobe"
+    if platform.system() == "Darwin" and use_defaults:
+        candidates = (
+            Path("/opt/homebrew/opt/ffmpeg-full/bin"),
+            Path("/usr/local/opt/ffmpeg-full/bin"),
+        )
+        for directory in candidates:
+            ffmpeg = directory / "ffmpeg"
+            ffprobe = directory / "ffprobe"
+            if ffmpeg.is_file() and ffprobe.is_file():
+                return str(ffmpeg), str(ffprobe), "Homebrew ffmpeg-full"
+    return (
+        resolve_tool(ffmpeg_value, "FFmpeg"),
+        resolve_tool(ffprobe_value, "ffprobe"),
+        "configured FFmpeg",
+    )
+
+
 def fraction_from_text(value: Any) -> Fraction | None:
     if value in (None, "", "0/0", "N/A"):
         return None
@@ -122,6 +322,68 @@ def fraction_from_text(value: Any) -> Fraction | None:
     except (ValueError, ZeroDivisionError):
         return None
     return result if result > 0 else None
+
+
+def duration_seconds(value: Any) -> float | None:
+    """Parse ffprobe numeric durations and Matroska DURATION tags."""
+    if value in (None, "", "N/A"):
+        return None
+    text = str(value).strip()
+    try:
+        if ":" not in text:
+            result = float(text)
+        else:
+            hours, minutes, seconds = text.split(":", 2)
+            result = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) and result >= 0 else None
+
+
+def stream_duration(stream: dict[str, Any]) -> float | None:
+    return duration_seconds(stream.get("duration")) or duration_seconds(
+        (stream.get("tags") or {}).get("DURATION")
+    )
+
+
+def stream_bit_rate(stream: dict[str, Any]) -> int | None:
+    candidates: list[Any] = [stream.get("bit_rate")]
+    tags = stream.get("tags") or {}
+    candidates.extend(
+        value
+        for key, value in tags.items()
+        if str(key).upper() in {"BPS", "BPS-ENG"}
+    )
+    for value in candidates:
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            continue
+        if result > 0:
+            return result
+    return None
+
+
+def selected_track_ordinals(
+    requested: Sequence[int] | None,
+    disabled: bool,
+    total: int,
+    label: str,
+) -> tuple[int, ...]:
+    if disabled:
+        return ()
+    if requested is None:
+        return tuple(range(total))
+    selected: list[int] = []
+    for ordinal in requested:
+        if ordinal < 0 or ordinal >= total:
+            raise TranscodeError(
+                f"--{label}-track {ordinal} is invalid; this input has {total} {label} track(s), "
+                f"numbered 0 through {max(0, total - 1)}."
+            )
+        if ordinal not in selected:
+            selected.append(ordinal)
+    return tuple(selected)
 
 
 def normalize_fps(value: Fraction) -> Fraction:
@@ -161,6 +423,22 @@ def probe_media(ffprobe: str, source: Path, force_hdr: bool) -> MediaInfo:
         raise TranscodeError(f"ffprobe returned invalid JSON: {exc}") from exc
 
     streams = payload.get("streams") or []
+    embedded_covers = [
+        item
+        for item in streams
+        if item.get("codec_type") == "video"
+        and int((item.get("disposition") or {}).get("attached_pic") or 0)
+    ]
+    embedded_covers.sort(
+        key=lambda item: (
+            0
+            if str((item.get("tags") or {}).get("filename") or "").lower()
+            in {"cover.jpg", "cover.jpeg", "cover.png"}
+            else 1,
+            int(item.get("index") or 0),
+        )
+    )
+    embedded_cover = embedded_covers[0] if embedded_covers else None
     video = next(
         (
             item
@@ -226,11 +504,11 @@ def probe_media(ffprobe: str, source: Path, force_hdr: bool) -> MediaInfo:
         or (high_bit_depth and wide_gamut)
     )
 
-    duration_value = (payload.get("format") or {}).get("duration")
-    try:
-        duration = float(duration_value) if duration_value not in (None, "N/A") else None
-    except (TypeError, ValueError):
-        duration = None
+    # The primary video duration is the playback contract. Matroska commonly
+    # stores it as a DURATION tag instead of stream.duration.
+    duration = stream_duration(video) or duration_seconds(
+        (payload.get("format") or {}).get("duration")
+    )
 
     return MediaInfo(
         video_stream_index=int(video.get("index") or 0),
@@ -247,12 +525,30 @@ def probe_media(ffprobe: str, source: Path, force_hdr: bool) -> MediaInfo:
         color_primaries=color_primaries,
         color_space=color_space,
         audio_stream_count=sum(item.get("codec_type") == "audio" for item in streams),
+        audio_stream_indices=tuple(
+            int(item.get("index") or 0)
+            for item in streams
+            if item.get("codec_type") == "audio"
+        ),
         subtitle_codecs=tuple(
             str(item.get("codec_name") or "unknown")
             for item in streams
             if item.get("codec_type") == "subtitle"
         ),
+        subtitle_stream_indices=tuple(
+            int(item.get("index") or 0)
+            for item in streams
+            if item.get("codec_type") == "subtitle"
+        ),
         attachment_count=sum(item.get("codec_type") == "attachment" for item in streams),
+        cover_stream_index=(
+            int(embedded_cover.get("index") or 0) if embedded_cover is not None else None
+        ),
+        cover_name=(
+            str((embedded_cover.get("tags") or {}).get("filename") or "embedded artwork")
+            if embedded_cover is not None
+            else ""
+        ),
         duration=duration,
     )
 
@@ -308,6 +604,19 @@ def target_fps(source_fps: Fraction, max_fps: Fraction) -> Fraction:
 
 
 def bitrate_plan(width: int, height: int, fps: Fraction, quality: str) -> tuple[int, int, int]:
+    if quality == "high" and width == OUTPUT_WIDTH and height == OUTPUT_HEIGHT:
+        cadence = float(fps)
+        if cadence <= 24.1:
+            target = 2_400_000
+        elif cadence <= 30.1:
+            target = 2_800_000
+        elif cadence <= 50.1:
+            target = 5_000_000
+        else:
+            target = 5_600_000
+        maxrate = 4_500_000 if cadence <= 30.1 else 8_000_000
+        return target, maxrate, maxrate * 2
+
     minimum, maximum = QUALITY_LIMITS[quality]
     estimated = width * height * float(fps) * QUALITY_BPP[quality]
     target = max(minimum, min(maximum, int(round(estimated / 100_000.0)) * 100_000))
@@ -316,8 +625,8 @@ def bitrate_plan(width: int, height: int, fps: Fraction, quality: str) -> tuple[
 
 
 def h264_level(width: int, height: int, fps: Fraction) -> str:
-    macroblocks_per_frame = math.ceil(width / 16) * math.ceil(height / 16)
-    return "3.2" if macroblocks_per_frame * float(fps) > 108_000 else "3.1"
+    del width, height
+    return "3.2" if fps > Fraction(30, 1) else "3.1"
 
 
 def filter_chain(
@@ -337,9 +646,11 @@ def filter_chain(
     if info.hdr:
         if "zscale" not in capabilities.filters or "tonemap" not in capabilities.filters:
             raise TranscodeError(
-                "HDR input detected, but this FFmpeg build lacks zscale/tonemap. "
-                "Install a full FFmpeg build compiled with --enable-libzimg; the tool "
-                "will not create an incorrectly clipped or washed-out SDR file."
+                "HDR input detected, but the selected FFmpeg executable lacks "
+                "zscale/tonemap. It may not be the ffmpeg-full binary you installed. "
+                "On macOS, leave both tool settings as ffmpeg/ffprobe for automatic "
+                "Homebrew ffmpeg-full discovery, or select its paired bin paths. "
+                "The tool will not create an incorrectly clipped or washed-out SDR file."
             )
         filters.extend(
             [
@@ -366,6 +677,7 @@ def filter_chain(
 
     filters.append("setsar=1")
     filters.append(f"fps={fps.numerator}/{fps.denominator}")
+    filters.append(f"setpts=N*{fps.denominator}/({fps.numerator}*TB)")
     if encoder_key == "vaapi":
         filters.extend(["format=nv12", "hwupload"])
     return ",".join(filters)
@@ -433,6 +745,8 @@ def encoder_arguments(
                 "0",
                 "-max_ref_frames",
                 "3",
+                "-bf",
+                "2",
                 "-coder",
                 "cabac",
             ]
@@ -441,13 +755,15 @@ def encoder_arguments(
         args.extend(
             [
                 "-preset",
-                "p5",
+                "p6",
                 "-tune",
                 "hq",
                 "-rc",
                 "vbr",
                 "-cq",
-                "19",
+                "18",
+                "-multipass",
+                "fullres",
                 "-spatial_aq",
                 "1",
                 "-temporal_aq",
@@ -507,12 +823,28 @@ def build_command(
     tone_map: str,
     vaapi_device: Path,
     preflight: bool,
+    audio_tracks: Sequence[int] | None = None,
+    subtitle_tracks: Sequence[int] | None = None,
+    system_load: str = "balanced",
+    preserve_extras: bool = True,
 ) -> list[str]:
     target_bps, maxrate_bps, bufsize_bps = bitrate_plan(width, height, fps, quality)
     level = h264_level(width, height, fps)
     gop = max(24, int(round(float(fps) * 2.0)))
 
     command = [ffmpeg, "-hide_banner", "-y"]
+    thread_limit = resource_thread_limit(system_load)
+    if thread_limit:
+        command.extend(
+            [
+                "-filter_threads",
+                str(max(1, min(4, thread_limit // 2))),
+                "-filter_complex_threads",
+                str(max(1, min(4, thread_limit // 2))),
+                "-threads",
+                str(thread_limit),
+            ]
+        )
     if preflight:
         command.extend(["-loglevel", "error"])
     if encoder_key == "vaapi":
@@ -521,10 +853,25 @@ def build_command(
         command.extend(["-hwaccel", "auto"])
     command.extend(["-i", str(source)])
     if preflight:
-        command.extend(["-t", "1"])
+        command.extend(["-t", f"{PREFLIGHT_SECONDS:g}"])
     command.extend(["-map", f"0:{info.video_stream_index}"])
     if not preflight:
-        command.extend(["-map", "0:a?", "-map", "0:s?", "-map", "0:t?"])
+        selected_audio = (
+            tuple(range(info.audio_stream_count))
+            if audio_tracks is None
+            else tuple(audio_tracks)
+        )
+        selected_subtitles = (
+            tuple(range(len(info.subtitle_codecs)))
+            if subtitle_tracks is None
+            else tuple(subtitle_tracks)
+        )
+        for ordinal in selected_audio:
+            command.extend(["-map", f"0:{info.audio_stream_indices[ordinal]}"])
+        for ordinal in selected_subtitles:
+            command.extend(["-map", f"0:{info.subtitle_stream_indices[ordinal]}"])
+        if preserve_extras:
+            command.extend(["-map", "0:t?"])
 
     command.extend(
         [
@@ -532,6 +879,8 @@ def build_command(
             filter_chain(info, width, height, fps, encoder_key, capabilities, tone_map),
             "-r",
             f"{fps.numerator}/{fps.denominator}",
+            "-fps_mode",
+            "cfr",
         ]
     )
     command.extend(
@@ -544,6 +893,8 @@ def build_command(
             gop,
         )
     )
+    if thread_limit and encoder_key == "x264":
+        command.extend(["-threads:v", str(thread_limit)])
     command.extend(
         [
             "-color_primaries",
@@ -558,9 +909,19 @@ def build_command(
     )
 
     if preflight:
-        command.extend(["-an", "-f", "null", destination])
+        command.extend(
+            [
+                "-an",
+                "-progress",
+                "pipe:1",
+                "-nostats",
+                "-f",
+                "null",
+                destination,
+            ]
+        )
     else:
-        if info.audio_stream_count:
+        if selected_audio:
             command.extend(
                 [
                     "-c:a",
@@ -575,7 +936,9 @@ def build_command(
                     "48000",
                 ]
             )
-        for output_index, codec in enumerate(info.subtitle_codecs):
+            command.extend(["-af", audio_filter(info.duration)])
+        for output_index, source_ordinal in enumerate(selected_subtitles):
+            codec = info.subtitle_codecs[source_ordinal]
             subtitle_codec = "srt" if codec in {"mov_text", "text", "webvtt"} else "copy"
             command.extend([f"-c:s:{output_index}", subtitle_codec])
         command.extend(["-c:t", "copy"])
@@ -609,6 +972,7 @@ def build_cover_command(
     source: Path,
     destination: Path,
     timestamp: float | None,
+    video_stream_index: int | None = None,
 ) -> list[str]:
     command = [ffmpeg, "-hide_banner", "-y"]
     if timestamp is not None and timestamp > 0:
@@ -618,7 +982,7 @@ def build_cover_command(
             "-i",
             str(source),
             "-map",
-            "0:v:0",
+            f"0:{video_stream_index}" if video_stream_index is not None else "0:v:0",
             "-frames:v",
             "1",
             "-vf",
@@ -666,6 +1030,98 @@ def build_attach_cover_command(
     ]
 
 
+def audio_filter(duration: float | None) -> str:
+    filters = ["aresample=async=1000:first_pts=0"]
+    if duration:
+        value = f"{duration:.6f}"
+        filters.extend([f"apad=whole_dur={value}", f"atrim=duration={value}"])
+    return ",".join(filters)
+
+
+def build_audio_repair_command(
+    ffmpeg: str,
+    source: Path,
+    destination: Path,
+    audio_bitrate: int,
+    duration: float | None,
+    audio_stream_indices: Sequence[int],
+) -> list[str]:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(source),
+    ]
+    for stream_index in audio_stream_indices:
+        command.extend(["-map", f"0:{stream_index}"])
+    command.extend(
+        [
+        "-vn",
+        "-sn",
+        "-dn",
+        "-c:a",
+        "aac",
+        "-profile:a",
+        "aac_low",
+        "-b:a",
+        f"{audio_bitrate}k",
+        "-ac",
+        "2",
+        "-ar",
+        "48000",
+        "-af",
+        audio_filter(duration),
+        "-map_metadata",
+        "0",
+        str(destination),
+        ]
+    )
+    return command
+
+
+def build_stream_remux_command(
+    ffmpeg: str,
+    video_source: Path,
+    original_source: Path,
+    destination: Path,
+    audio_source: Path | None,
+    subtitle_stream_indices: Sequence[int],
+    subtitle_codecs: Sequence[str],
+) -> list[str]:
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(video_source),
+    ]
+    if audio_source is not None:
+        command.extend(["-i", str(audio_source)])
+    original_input = 2 if audio_source is not None else 1
+    command.extend(["-i", str(original_source), "-map", "0:v:0"])
+    if audio_source is not None:
+        command.extend(["-map", "1:a?"])
+    for stream_index in subtitle_stream_indices:
+        command.extend(["-map", f"{original_input}:{stream_index}"])
+    command.extend(["-map", f"{original_input}:t?", "-c", "copy"])
+    for output_index, codec in enumerate(subtitle_codecs):
+        if codec in {"mov_text", "text", "webvtt"}:
+            command.extend([f"-c:s:{output_index}", "srt"])
+    command.extend(
+        [
+            "-map_metadata",
+            str(original_input),
+            "-map_chapters",
+            str(original_input),
+            "-max_muxing_queue_size",
+            "4096",
+            str(destination),
+        ]
+    )
+    return command
+
+
 def preflight_encoder(
     ffmpeg: str,
     source: Path,
@@ -680,6 +1136,7 @@ def preflight_encoder(
     audio_bitrate: int,
     tone_map: str,
     vaapi_device: Path,
+    system_load: str,
 ) -> EncoderPlan | None:
     decode_modes = [True, False] if prefer_hw_decode and key != "vaapi" else [False]
     for hw_decode in decode_modes:
@@ -699,23 +1156,92 @@ def preflight_encoder(
             tone_map,
             vaapi_device,
             preflight=True,
+            system_load=system_load,
         )
         result = subprocess.run(
-            command,
+            prioritized_command(command, system_load),
             check=False,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            **process_priority_kwargs(system_load),
         )
-        if result.returncode == 0:
+        reported_frames = [int(value) for value in re.findall(r"(?m)^frame=(\d+)$", result.stdout)]
+        frame_count = reported_frames[-1] if reported_frames else 0
+        probe_duration = min(PREFLIGHT_SECONDS, info.duration or PREFLIGHT_SECONDS)
+        minimum_frames = max(1, int(float(fps) * probe_duration * 0.60))
+        if result.returncode == 0 and frame_count >= minimum_frames:
             return EncoderPlan(key=key, codec=ENCODER_NAMES[key], hw_decode=hw_decode)
         mode = "hardware decode" if hw_decode else "software decode"
+        if result.returncode == 0:
+            print(
+                f"Preflight rejected {ENCODER_NAMES[key]} ({mode}): encoded only "
+                f"{frame_count}/{minimum_frames} required frames in {probe_duration:.1f}s.",
+                file=sys.stderr,
+            )
+            continue
+        error_lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
         last_line = next(
-            (line.strip() for line in reversed(result.stderr.splitlines()) if line.strip()),
-            "unknown FFmpeg error",
+            (
+                line
+                for token in (
+                    "Cannot create compression session",
+                    "Error while opening encoder",
+                    "Error while filtering",
+                    "failed",
+                    "error",
+                )
+                for line in error_lines
+                if token.lower() in line.lower()
+            ),
+            error_lines[-1] if error_lines else "unknown FFmpeg error",
         )
         print(f"Preflight rejected {ENCODER_NAMES[key]} ({mode}): {last_line}", file=sys.stderr)
     return None
+
+
+def fallback_video_plan(
+    ffmpeg: str,
+    source: Path,
+    info: MediaInfo,
+    capabilities: Capabilities,
+    current: EncoderPlan,
+    width: int,
+    height: int,
+    fps: Fraction,
+    quality: str,
+    audio_bitrate: int,
+    tone_map: str,
+    vaapi_device: Path,
+    system_load: str,
+) -> EncoderPlan:
+    candidates: list[str] = []
+    if current.hw_decode:
+        candidates.append(current.key)
+    if current.key != "x264" and ENCODER_NAMES["x264"] in capabilities.encoders:
+        candidates.append("x264")
+    for key in candidates:
+        candidate = preflight_encoder(
+            ffmpeg,
+            source,
+            info,
+            capabilities,
+            key,
+            False,
+            width,
+            height,
+            fps,
+            quality,
+            audio_bitrate,
+            tone_map,
+            vaapi_device,
+            system_load,
+        )
+        if candidate is not None:
+            return candidate
+    raise TranscodeError(
+        "The video pipeline stalled and no independently preflighted safe fallback was available."
+    )
 
 
 def validate_output(
@@ -725,6 +1251,9 @@ def validate_output(
     expected_subtitle_count: int,
     expected_fps: Fraction,
     require_cover: bool,
+    expected_duration: float | None = None,
+    validate_audio_duration: bool = True,
+    expected_attachment_count: int | None = None,
 ) -> dict[str, Any]:
     payload = json.loads(
         run_capture(
@@ -762,20 +1291,49 @@ def validate_output(
     if video.get("color_space") != "bt709" or video.get("color_range") != "tv":
         raise TranscodeError("Output validation failed: video is not tagged BT.709 limited-range.")
 
+    output_duration = stream_duration(video) or duration_seconds(
+        (payload.get("format") or {}).get("duration")
+    )
+    duration_reference = expected_duration or output_duration
+    if expected_duration is not None and output_duration is not None:
+        if abs(output_duration - expected_duration) > 2.0:
+            raise VideoDurationError(
+                "Output validation failed: video duration is "
+                f"{output_duration:.3f}s, expected {expected_duration:.3f}s."
+            )
+
     audio_streams = [item for item in streams if item.get("codec_type") == "audio"]
     if len(audio_streams) != expected_audio_count:
         raise TranscodeError("Output validation failed: one or more audio tracks are missing.")
-    for audio in audio_streams:
+    for track_number, audio in enumerate(audio_streams, start=1):
         if audio.get("codec_name") != "aac":
             raise TranscodeError("Output validation failed: an audio track is not AAC.")
         if int(audio.get("channels") or 0) > 2:
             raise TranscodeError("Output validation failed: an AAC track has more than two channels.")
         if int(audio.get("sample_rate") or 0) != 48_000:
             raise TranscodeError("Output validation failed: an AAC track is not 48 kHz.")
+        audio_duration = stream_duration(audio)
+        if validate_audio_duration and duration_reference is not None:
+            if audio_duration is None:
+                raise AudioDurationError(
+                    f"Output validation failed: audio track {track_number} has no duration."
+                )
+            if abs(audio_duration - duration_reference) > 2.0:
+                raise AudioDurationError(
+                    "Output validation failed: audio track "
+                    f"{track_number} ends at {audio_duration:.3f}s, but video ends at "
+                    f"{duration_reference:.3f}s. The incomplete file was not published."
+                )
 
     subtitle_count = sum(item.get("codec_type") == "subtitle" for item in streams)
     if subtitle_count != expected_subtitle_count:
         raise TranscodeError("Output validation failed: one or more subtitle tracks are missing.")
+    attachment_count = sum(item.get("codec_type") == "attachment" for item in streams)
+    if (
+        expected_attachment_count is not None
+        and attachment_count != expected_attachment_count
+    ):
+        raise TranscodeError("Output validation failed: one or more attachments are missing.")
     format_names = str((payload.get("format") or {}).get("format_name") or "")
     if "matroska" not in format_names:
         raise TranscodeError("Output validation failed: output container is not Matroska.")
@@ -818,6 +1376,10 @@ def print_summary(
     plan: EncoderPlan,
     target_bps: int,
     maxrate_bps: int,
+    audio_bitrate: int,
+    selected_audio_count: int,
+    selected_subtitle_count: int,
+    system_load: str,
     cover_description: str,
 ) -> None:
     print("\nVitaMediaDeck conversion plan")
@@ -825,11 +1387,44 @@ def print_summary(
     print(f"  Color:       {'HDR -> BT.709 SDR' if info.hdr else 'SDR BT.709 output'}")
     print(f"  Output:      H.264 High, {width}x{height}, {float(fps):.3f} fps")
     print(f"  Encoder:     {plan.codec}")
-    print(f"  HW decode:   {'requested (FFmpeg may fall back)' if plan.hw_decode else 'disabled'}")
+    if plan.hw_decode:
+        decode_detail = "requested (FFmpeg may fall back)"
+    elif info.hdr:
+        encode_detail = (
+            "software encode selected"
+            if plan.key == "x264"
+            else "hardware encode remains active"
+        )
+        decode_detail = f"software for stable HDR tone mapping; {encode_detail}"
+    else:
+        decode_detail = "disabled"
+    print(f"  HW decode:   {decode_detail}")
+    thread_limit = resource_thread_limit(system_load)
+    load_detail = "unlimited" if thread_limit == 0 else f"up to {thread_limit} FFmpeg threads"
+    print(f"  System load: {system_load} ({load_detail})")
     print(f"  Video rate:  {target_bps / 1_000_000:.1f} Mb/s target, {maxrate_bps / 1_000_000:.1f} Mb/s max")
-    print(f"  Audio:       {info.audio_stream_count} AAC-LC stereo 48 kHz track(s)")
-    print(f"  Subtitles:   {len(info.subtitle_codecs)} preserved track(s)")
+    print(
+        f"  Audio:       {selected_audio_count}/{info.audio_stream_count} selected; "
+        f"AAC-LC stereo 48 kHz at {audio_bitrate} kb/s each"
+    )
+    print("  A/V guard:   timestamp repair, duration padding/trim, per-track validation")
+    print(
+        f"  Subtitles:   {selected_subtitle_count}/{len(info.subtitle_codecs)} "
+        "selected track(s)"
+    )
     print(f"  Cover:       {cover_description}")
+    if info.duration:
+        total_bps = target_bps + selected_audio_count * audio_bitrate * 1000
+        estimated_bytes = info.duration * total_bps / 8
+        estimated_text = (
+            f"{estimated_bytes / 1_000_000_000:.2f} GB"
+            if estimated_bytes >= 100_000_000
+            else f"{estimated_bytes / 1_000_000:.1f} MB"
+        )
+        print(
+            f"  Size model:  about {estimated_text} "
+            "(duration x configured bitrates; resolution alone does not set size)"
+        )
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -860,6 +1455,39 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--audio-bitrate", type=int, default=192, help="AAC bitrate in kb/s")
     parser.add_argument(
+        "--system-load",
+        choices=tuple(SYSTEM_LOAD_THREADS),
+        default="balanced",
+        help=(
+            "desktop resource policy: low uses 2 FFmpeg threads, balanced leaves two "
+            "CPU cores free (up to 8 threads), full removes limits (default: balanced)"
+        ),
+    )
+    audio_group = parser.add_mutually_exclusive_group()
+    audio_group.add_argument(
+        "--audio-track",
+        type=int,
+        action="append",
+        help="preserve this zero-based input audio track; repeat to select multiple (default: all)",
+    )
+    audio_group.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="omit every audio track",
+    )
+    subtitle_group = parser.add_mutually_exclusive_group()
+    subtitle_group.add_argument(
+        "--subtitle-track",
+        type=int,
+        action="append",
+        help="preserve this zero-based input subtitle track; repeat to select multiple (default: all)",
+    )
+    subtitle_group.add_argument(
+        "--no-subtitles",
+        action="store_true",
+        help="omit every subtitle track",
+    )
+    parser.add_argument(
         "--tone-map",
         choices=["mobius", "hable", "reinhard"],
         default="mobius",
@@ -883,7 +1511,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     cover_group.add_argument(
         "--cover-image",
         type=Path,
-        help="use this image for the embedded cover instead of extracting a video frame",
+        help="use this image instead of embedded input artwork or an extracted video frame",
     )
     cover_group.add_argument(
         "--no-cover",
@@ -898,8 +1526,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
-        ffmpeg = resolve_tool(args.ffmpeg, "FFmpeg")
-        ffprobe = resolve_tool(args.ffprobe, "ffprobe")
+        ffmpeg, ffprobe, tool_origin = resolve_media_tools(args.ffmpeg, args.ffprobe)
+        print(f"FFmpeg toolchain: {tool_origin} ({ffmpeg})")
         source = args.input.expanduser().resolve()
         if not source.is_file():
             raise TranscodeError(f"Input file not found: {source}")
@@ -922,11 +1550,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         if max_fps is None or max_fps > MAX_FPS:
             raise TranscodeError("--max-fps must be greater than zero and no higher than 60.")
 
+        announce_phase(1, 7, "Inspecting input media and FFmpeg capabilities...", "analysis")
         capabilities = discover_capabilities(ffmpeg)
         info = probe_media(ffprobe, source, args.force_hdr)
+        selected_audio_tracks = selected_track_ordinals(
+            args.audio_track,
+            args.no_audio,
+            info.audio_stream_count,
+            "audio",
+        )
+        selected_subtitle_tracks = selected_track_ordinals(
+            args.subtitle_track,
+            args.no_subtitles,
+            len(info.subtitle_codecs),
+            "subtitle",
+        )
         width, height = fitted_dimensions(info)
         fps = target_fps(info.fps, max_fps)
         candidates = encoder_candidates(args.encoder, capabilities, args.vaapi_device)
+        # HDR tone mapping is a CPU filter chain. Keeping decoded frames in
+        # VideoToolbox only to download them for zscale adds pressure to shared
+        # GPU memory and has produced severe timestamp starvation on long HEVC
+        # sources. Hardware encoding remains enabled and provides the main gain.
+        prefer_hw_decode = not args.no_hw_decode and not info.hdr
 
         if info.hdr:
             # Validate the HDR filter contract before attempting encoder probes.
@@ -939,14 +1585,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 capabilities,
                 args.tone_map,
             )
+        emit_progress("analysis", "done")
 
         if args.dry_run:
             plan = EncoderPlan(
                 candidates[0],
                 ENCODER_NAMES[candidates[0]],
-                not args.no_hw_decode and candidates[0] != "vaapi",
+                prefer_hw_decode and candidates[0] != "vaapi",
             )
         else:
+            announce_phase(
+                2,
+                7,
+                "Testing H.264 encoders and decode paths...",
+                "preflight",
+            )
             plan = next(
                 (
                     result
@@ -958,7 +1611,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             info,
                             capabilities,
                             key,
-                            not args.no_hw_decode,
+                            prefer_hw_decode,
                             width,
                             height,
                             fps,
@@ -966,6 +1619,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             args.audio_bitrate,
                             args.tone_map,
                             args.vaapi_device,
+                            args.system_load,
                         )
                     )
                     is not None
@@ -973,11 +1627,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 None,
             )
             if plan is None:
-                raise TranscodeError("Every available H.264 encoder failed its one-second preflight.")
+                raise TranscodeError(
+                    "Every available H.264 encoder failed its three-second frame preflight."
+                )
+            emit_progress("preflight", "done", plan.codec)
 
         target_bps, maxrate_bps, _ = bitrate_plan(width, height, fps, args.quality)
         if custom_cover is not None:
             cover_description = f"embedded JPEG from {custom_cover.name}"
+        elif cover_enabled and info.cover_stream_index is not None:
+            cover_description = f"embedded input cover ({info.cover_name})"
         elif cover_enabled:
             cover_description = "embedded JPEG from a representative frame"
         else:
@@ -990,10 +1649,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             plan,
             target_bps,
             maxrate_bps,
+            args.audio_bitrate,
+            len(selected_audio_tracks),
+            len(selected_subtitle_tracks),
+            args.system_load,
             cover_description,
         )
 
         temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
+        audio_temporary = output.with_name(f".{output.stem}.audio-repair.mka")
+        repaired_temporary = output.with_name(f".{output.stem}.repaired.partial{output.suffix}")
         cover_file = output.with_name(f".{output.stem}.cover.jpg")
         covered_temporary = output.with_name(f".{output.stem}.covered.partial{output.suffix}")
         command = build_command(
@@ -1012,19 +1677,79 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.tone_map,
             args.vaapi_device,
             preflight=False,
+            # Video is encoded independently so timed non-video streams cannot
+            # run the Matroska clock hours ahead of a slow 4K HDR filter graph.
+            audio_tracks=(),
+            subtitle_tracks=(),
+            system_load=args.system_load,
+            preserve_extras=False,
+        )
+        audio_command = (
+            build_audio_repair_command(
+                ffmpeg,
+                source,
+                audio_temporary,
+                args.audio_bitrate,
+                info.duration,
+                tuple(
+                    info.audio_stream_indices[ordinal]
+                    for ordinal in selected_audio_tracks
+                ),
+            )
+            if selected_audio_tracks
+            else None
+        )
+        replacement_command = build_stream_remux_command(
+            ffmpeg,
+            temporary,
+            source,
+            repaired_temporary,
+            audio_temporary if selected_audio_tracks else None,
+            tuple(
+                info.subtitle_stream_indices[ordinal]
+                for ordinal in selected_subtitle_tracks
+            ),
+            tuple(
+                info.subtitle_codecs[ordinal]
+                for ordinal in selected_subtitle_tracks
+            ),
         )
         print("\nCommand:")
         print(command_text(command))
+        if audio_command is not None:
+            print("\nIsolated audio command:")
+            print(command_text(audio_command))
+        print("\nFinal stream remux command:")
+        print(command_text(replacement_command))
+        fallback_cover_command: list[str] | None = None
         if cover_enabled:
-            cover_source = custom_cover or temporary
-            cover_timestamp = (
-                None if custom_cover is not None else representative_timestamp(info.duration)
-            )
+            if custom_cover is not None:
+                cover_source = custom_cover
+                cover_timestamp = None
+                cover_stream_index = None
+                cover_origin = f"custom artwork: {custom_cover.name}"
+            elif info.cover_stream_index is not None:
+                cover_source = source
+                cover_timestamp = None
+                cover_stream_index = info.cover_stream_index
+                cover_origin = f"embedded input cover: {info.cover_name}"
+                fallback_cover_command = build_cover_command(
+                    ffmpeg,
+                    temporary,
+                    cover_file,
+                    representative_timestamp(info.duration),
+                )
+            else:
+                cover_source = temporary
+                cover_timestamp = representative_timestamp(info.duration)
+                cover_stream_index = None
+                cover_origin = "representative frame from converted video"
             cover_command = build_cover_command(
                 ffmpeg,
                 cover_source,
                 cover_file,
                 cover_timestamp,
+                cover_stream_index,
             )
             attach_command = build_attach_cover_command(
                 ffmpeg,
@@ -1035,58 +1760,218 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             print("\nCover command:")
             print(command_text(cover_command))
+            if fallback_cover_command is not None:
+                print("\nCover fallback command (used only if embedded artwork cannot be decoded):")
+                print(command_text(fallback_cover_command))
             print("\nCover attachment command:")
             print(command_text(attach_command))
         if args.dry_run:
             return 0
 
         output.parent.mkdir(parents=True, exist_ok=True)
-        for work_file in (temporary, cover_file, covered_temporary):
+        for work_file in (
+            temporary,
+            audio_temporary,
+            repaired_temporary,
+            cover_file,
+            covered_temporary,
+        ):
             if work_file.exists():
                 work_file.unlink()
         try:
-            result = subprocess.run(command, check=False)
-            if result.returncode != 0:
-                raise TranscodeError(f"FFmpeg exited with status {result.returncode}.")
-            if not temporary.is_file():
-                raise TranscodeError("FFmpeg reported success but did not create the output file.")
+            announce_phase(
+                3,
+                7,
+                "Transcoding the isolated video stream with a video-only clock...",
+                "transcode",
+                f"VIDEO PASS // {plan.codec}",
+            )
+
+            def execute_video_attempt(active_command: Sequence[str]) -> None:
+                result = run_transcode_guarded(active_command, args.system_load, fps)
+                if result.returncode != 0:
+                    raise TranscodeError(f"FFmpeg exited with status {result.returncode}.")
+                if not temporary.is_file():
+                    raise TranscodeError(
+                        "FFmpeg reported success but did not create the output file."
+                    )
+                # Validate the video before entering the isolated audio pass or artwork
+                # stages. This catches the long-HDR failure where audio reaches
+                # EOF while VideoToolbox emits only a handful of video frames.
+                validate_output(
+                    ffprobe,
+                    temporary,
+                    0,
+                    0,
+                    fps,
+                    False,
+                    info.duration,
+                    validate_audio_duration=False,
+                    expected_attachment_count=0,
+                )
+
+            try:
+                execute_video_attempt(command)
+            except VideoPipelineError as exc:
+                print(
+                    "Warning: the selected video pipeline did not sustain valid frame output. "
+                    "Retrying with an independently tested safe decode/encoder path.",
+                    file=sys.stderr,
+                )
+                print(f"Detected: {exc}", file=sys.stderr)
+                emit_progress(
+                    "transcode",
+                    "fallback",
+                    "VIDEO RECOVERY // stable timestamps + software decode fallback",
+                )
+                plan = fallback_video_plan(
+                    ffmpeg,
+                    source,
+                    info,
+                    capabilities,
+                    plan,
+                    width,
+                    height,
+                    fps,
+                    args.quality,
+                    args.audio_bitrate,
+                    args.tone_map,
+                    args.vaapi_device,
+                    args.system_load,
+                )
+                if temporary.exists():
+                    temporary.unlink()
+                command = build_command(
+                    ffmpeg,
+                    source,
+                    str(temporary),
+                    info,
+                    capabilities,
+                    plan.key,
+                    plan.hw_decode,
+                    width,
+                    height,
+                    fps,
+                    args.quality,
+                    args.audio_bitrate,
+                    args.tone_map,
+                    args.vaapi_device,
+                    preflight=False,
+                    audio_tracks=(),
+                    subtitle_tracks=(),
+                    system_load=args.system_load,
+                    preserve_extras=False,
+                )
+                print(f"\nVideo recovery plan: {plan.codec} with software decoding")
+                print(command_text(command))
+                execute_video_attempt(command)
+
+            if audio_command is not None:
+                emit_progress(
+                    "transcode",
+                    "stage",
+                    f"AUDIO PASS // {len(selected_audio_tracks)} selected AAC track(s)",
+                )
+                print("\nEncoding selected audio tracks independently...")
+                result = run_ffmpeg(audio_command, args.system_load)
+                if result.returncode != 0 or not audio_temporary.is_file():
+                    raise TranscodeError("The isolated AAC pass failed.")
+            emit_progress(
+                "transcode",
+                "stage",
+                "FINAL REMUX // adding audio, subtitles, and attachments",
+            )
+            print("\nRemuxing video, audio, subtitles, and attachments...")
+            result = run_ffmpeg(replacement_command, args.system_load)
+            if result.returncode != 0 or not repaired_temporary.is_file():
+                raise TranscodeError("The final stream remux failed.")
+            os.replace(repaired_temporary, temporary)
+            emit_progress("transcode", "done")
+            announce_phase(4, 7, "Validating the transcoded media contract...", "media_validation")
             validate_output(
                 ffprobe,
                 temporary,
-                info.audio_stream_count,
-                len(info.subtitle_codecs),
+                len(selected_audio_tracks),
+                len(selected_subtitle_tracks),
                 fps,
                 False,
+                info.duration,
+                expected_attachment_count=info.attachment_count,
             )
+            emit_progress("media_validation", "done")
             final_temporary = temporary
             if cover_enabled:
-                result = subprocess.run(cover_command, check=False)
+                announce_phase(5, 7, f"Preparing cover artwork ({cover_origin})...", "cover", cover_origin)
+                result = run_ffmpeg(cover_command, args.system_load)
+                if (
+                    (result.returncode != 0 or not cover_file.is_file())
+                    and fallback_cover_command is not None
+                ):
+                    if cover_file.exists():
+                        cover_file.unlink()
+                    print(
+                        "Warning: embedded cover could not be decoded; "
+                        "using a representative video frame instead.",
+                        file=sys.stderr,
+                    )
+                    emit_progress(
+                        "cover",
+                        "fallback",
+                        "embedded artwork failed; generating representative frame",
+                    )
+                    result = run_ffmpeg(fallback_cover_command, args.system_load)
                 if result.returncode != 0 or not cover_file.is_file():
                     raise TranscodeError("FFmpeg could not generate the cover image.")
-                result = subprocess.run(attach_command, check=False)
+                emit_progress("cover", "done")
+                announce_phase(
+                    6,
+                    7,
+                    "Attaching cover and remuxing Matroska without re-encoding...",
+                    "package",
+                )
+                result = run_ffmpeg(attach_command, args.system_load)
                 if result.returncode != 0 or not covered_temporary.is_file():
                     raise TranscodeError("FFmpeg could not embed the cover image.")
+                emit_progress("package", "done")
+                announce_phase(7, 7, "Running final output validation...", "final_validation")
                 validate_output(
                     ffprobe,
                     covered_temporary,
-                    info.audio_stream_count,
-                    len(info.subtitle_codecs),
+                    len(selected_audio_tracks),
+                    len(selected_subtitle_tracks),
                     fps,
                     True,
+                    info.duration,
+                    expected_attachment_count=info.attachment_count,
                 )
+                emit_progress("final_validation", "done")
                 final_temporary = covered_temporary
+            else:
+                print("\n[5/7] Cover disabled; artwork and remux phases skipped.", flush=True)
+                emit_progress("cover", "skipped", "disabled")
+                emit_progress("package", "skipped", "disabled")
+                emit_progress("final_validation", "done", "validated without cover")
             os.replace(final_temporary, output)
+            emit_progress("complete", "done", str(output))
         finally:
-            for work_file in (temporary, cover_file, covered_temporary):
+            for work_file in (
+                temporary,
+                audio_temporary,
+                repaired_temporary,
+                cover_file,
+                covered_temporary,
+            ):
                 if work_file.exists():
                     work_file.unlink()
 
         print(f"\nReady: {output}")
         return 0
     except KeyboardInterrupt:
+        emit_progress("cancelled", "done")
         print("\nConversion interrupted.", file=sys.stderr)
         return 130
     except (TranscodeError, OSError, json.JSONDecodeError) as exc:
+        emit_progress("error", "done", str(exc))
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
