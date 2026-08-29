@@ -31,6 +31,9 @@ OUTPUT_WIDTH = 960
 OUTPUT_HEIGHT = 544
 COVER_WIDTH = 480
 COVER_HEIGHT = 272
+COVER_THUMBNAIL_WINDOW_FRAMES = 120
+COVER_BLACK_YAVG_MAX = 10.0
+COVER_BLACK_YMAX_MAX = 32.0
 MAX_FPS = Fraction(60, 1)
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67", "hlg", "pq"}
 ENCODER_NAMES = {
@@ -967,6 +970,15 @@ def representative_timestamp(duration: float | None) -> float:
     return min(max(duration * 0.10, 1.0), 30.0, duration - 0.1)
 
 
+def alternate_representative_timestamp(duration: float | None) -> float | None:
+    """Return a distant second candidate when the primary frame is unusable."""
+    if duration is None or duration <= 2.0:
+        return None
+    primary = representative_timestamp(duration)
+    alternate = min(max(duration * 0.50, 1.0), duration - 0.1)
+    return alternate if abs(alternate - primary) >= 1.0 else None
+
+
 def build_cover_command(
     ffmpeg: str,
     source: Path,
@@ -977,6 +989,20 @@ def build_cover_command(
     command = [ffmpeg, "-hide_banner", "-y"]
     if timestamp is not None and timestamp > 0:
         command.extend(["-ss", f"{timestamp:.3f}"])
+    filters: list[str] = []
+    if timestamp is not None:
+        # A single timestamp can land on a fade-to-black. Pick the most
+        # representative picture from the following short window while still
+        # keeping generation bounded and seek-friendly.
+        filters.append(f"thumbnail={COVER_THUMBNAIL_WINDOW_FRAMES}")
+    filters.extend(
+        [
+            f"scale={COVER_WIDTH}:{COVER_HEIGHT}:force_original_aspect_ratio=decrease:"
+            "flags=lanczos",
+            f"pad={COVER_WIDTH}:{COVER_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black",
+            "setsar=1",
+        ]
+    )
     command.extend(
         [
             "-i",
@@ -986,11 +1012,7 @@ def build_cover_command(
             "-frames:v",
             "1",
             "-vf",
-            (
-                f"scale={COVER_WIDTH}:{COVER_HEIGHT}:force_original_aspect_ratio=decrease:"
-                "flags=lanczos,"
-                f"pad={COVER_WIDTH}:{COVER_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
-            ),
+            ",".join(filters),
             "-pix_fmt",
             "yuvj420p",
             "-q:v",
@@ -1001,6 +1023,39 @@ def build_cover_command(
         ]
     )
     return command
+
+
+def cover_is_nearly_black(ffmpeg: str, cover: Path) -> bool:
+    """Reject technically valid artwork that disappears on the OLED canvas."""
+    output = run_capture(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(cover),
+            "-frames:v",
+            "1",
+            "-vf",
+            "signalstats,metadata=mode=print:file=-",
+            "-f",
+            "null",
+            "-",
+        ],
+        "cover luminance analysis",
+    )
+    values: dict[str, float] = {}
+    for key in ("YAVG", "YMAX"):
+        match = re.search(rf"lavfi\.signalstats\.{key}=([0-9]+(?:\.[0-9]+)?)", output)
+        if match:
+            values[key] = float(match.group(1))
+    if len(values) != 2:
+        raise TranscodeError("FFmpeg did not report cover luminance metadata.")
+    return (
+        values["YAVG"] <= COVER_BLACK_YAVG_MAX
+        and values["YMAX"] <= COVER_BLACK_YMAX_MAX
+    )
 
 
 def build_attach_cover_command(
@@ -1722,6 +1777,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("\nFinal stream remux command:")
         print(command_text(replacement_command))
         fallback_cover_command: list[str] | None = None
+        fallback_cover_reason = ""
+        reject_black_cover = False
         if cover_enabled:
             if custom_cover is not None:
                 cover_source = custom_cover
@@ -1739,11 +1796,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cover_file,
                     representative_timestamp(info.duration),
                 )
+                fallback_cover_reason = "embedded artwork is invalid or nearly black"
+                reject_black_cover = True
             else:
                 cover_source = temporary
                 cover_timestamp = representative_timestamp(info.duration)
                 cover_stream_index = None
                 cover_origin = "representative frame from converted video"
+                alternate_timestamp = alternate_representative_timestamp(info.duration)
+                if alternate_timestamp is not None:
+                    fallback_cover_command = build_cover_command(
+                        ffmpeg,
+                        temporary,
+                        cover_file,
+                        alternate_timestamp,
+                    )
+                    fallback_cover_reason = "primary representative window is nearly black"
+                reject_black_cover = True
             cover_command = build_cover_command(
                 ffmpeg,
                 cover_source,
@@ -1761,7 +1830,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("\nCover command:")
             print(command_text(cover_command))
             if fallback_cover_command is not None:
-                print("\nCover fallback command (used only if embedded artwork cannot be decoded):")
+                print("\nCover fallback command (used if the first artwork is unusable):")
                 print(command_text(fallback_cover_command))
             print("\nCover attachment command:")
             print(command_text(attach_command))
@@ -1903,25 +1972,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             if cover_enabled:
                 announce_phase(5, 7, f"Preparing cover artwork ({cover_origin})...", "cover", cover_origin)
                 result = run_ffmpeg(cover_command, args.system_load)
+                first_cover_failed = result.returncode != 0 or not cover_file.is_file()
+                if not first_cover_failed and reject_black_cover:
+                    first_cover_failed = cover_is_nearly_black(ffmpeg, cover_file)
                 if (
-                    (result.returncode != 0 or not cover_file.is_file())
+                    first_cover_failed
                     and fallback_cover_command is not None
                 ):
                     if cover_file.exists():
                         cover_file.unlink()
                     print(
-                        "Warning: embedded cover could not be decoded; "
-                        "using a representative video frame instead.",
+                        f"Warning: {fallback_cover_reason}; using the alternate "
+                        "representative video window instead.",
                         file=sys.stderr,
                     )
                     emit_progress(
                         "cover",
                         "fallback",
-                        "embedded artwork failed; generating representative frame",
+                        f"{fallback_cover_reason}; generating alternate frame",
                     )
                     result = run_ffmpeg(fallback_cover_command, args.system_load)
                 if result.returncode != 0 or not cover_file.is_file():
                     raise TranscodeError("FFmpeg could not generate the cover image.")
+                if reject_black_cover and cover_is_nearly_black(ffmpeg, cover_file):
+                    raise TranscodeError(
+                        "FFmpeg generated a nearly black cover twice; provide "
+                        "--cover-image to choose artwork explicitly."
+                    )
                 emit_progress("cover", "done")
                 announce_phase(
                     6,

@@ -18,8 +18,9 @@ FFmpeg-compatible input files are converted to a seekable Matroska file with:
 - selected audio tracks as AAC-LC stereo, 48 kHz;
 - selected subtitle tracks, chapters, language/title metadata, and compatible
   Matroska font attachments;
-- an embedded 480×272 `cover.jpg`, using existing artwork first and a video
-  frame only as fallback.
+- an embedded 480×272 `cover.jpg`, using existing artwork first and a bounded
+  representative video window as fallback. Near-black artwork is rejected and
+  retried at a distant timestamp so it remains visible on the Vita OLED theme.
 
 Matroska is deliberate: unlike MP4, it can retain formats such as ASS, PGS,
 VobSub, and subtitle-font attachments. VitaMediaDeck demuxes H.264/AAC from
