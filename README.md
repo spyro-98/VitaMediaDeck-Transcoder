@@ -15,7 +15,9 @@ can decode. It produces a seekable Matroska file with this playback profile:
   30000/1001, 50, and 60000/1001;
 - every audio track converted independently to AAC-LC, stereo, 48 kHz;
 - all subtitle streams retained, along with chapters, language/title metadata,
-  and Matroska subtitle-font attachments.
+  and Matroska subtitle-font attachments;
+- an embedded 480x272 `cover.jpg`, generated from a representative SDR frame
+  for compatible file browsers and media-library views.
 
 Matroska is intentional: MP4 cannot retain every mainstream subtitle type,
 including PGS, VobSub, and ASS font attachments. VitaMediaDeck's hardware and
@@ -79,6 +81,27 @@ python3 vitamediadeck_transcoder.py input.mkv --encoder x264
 Use `--quality balanced` or `--quality compact` to reduce the file size. The
 default `high` profile targets about 2.4 Mb/s at 24 fps, 2.8 Mb/s at 30 fps,
 and 5.6 Mb/s at 60 fps for a full 960x544 frame, with bounded VBR peaks.
+
+## Embedded video covers
+
+By default, the tool extracts a representative frame from the converted SDR
+video, scales it to 480x272, and embeds it in the Matroska output using the
+standard `cover.jpg` filename and `image/jpeg` MIME type. Generating the cover
+from the converted stream also gives HDR sources a correctly tone-mapped SDR
+thumbnail. Existing subtitle-font attachments remain intact.
+
+Use a custom image instead:
+
+```sh
+python3 vitamediadeck_transcoder.py input.mkv --cover-image poster.png
+```
+
+The custom image is resized with its aspect ratio preserved and padded when
+necessary. Disable cover generation explicitly with:
+
+```sh
+python3 vitamediadeck_transcoder.py input.mkv --no-cover
+```
 
 ## 4K HDR, HDR10, HLG, and Dolby Vision sources
 

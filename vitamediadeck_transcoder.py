@@ -25,6 +25,8 @@ from typing import Any, Sequence
 
 OUTPUT_WIDTH = 960
 OUTPUT_HEIGHT = 544
+COVER_WIDTH = 480
+COVER_HEIGHT = 272
 MAX_FPS = Fraction(60, 1)
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67", "hlg", "pq"}
 ENCODER_NAMES = {
@@ -63,6 +65,7 @@ class MediaInfo:
     color_space: str
     audio_stream_count: int
     subtitle_codecs: tuple[str, ...]
+    attachment_count: int
     duration: float | None
 
 
@@ -249,6 +252,7 @@ def probe_media(ffprobe: str, source: Path, force_hdr: bool) -> MediaInfo:
             for item in streams
             if item.get("codec_type") == "subtitle"
         ),
+        attachment_count=sum(item.get("codec_type") == "attachment" for item in streams),
         duration=duration,
     )
 
@@ -592,6 +596,76 @@ def build_command(
     return command
 
 
+def representative_timestamp(duration: float | None) -> float:
+    if duration is None or duration <= 0:
+        return 0.0
+    if duration <= 1.0:
+        return duration * 0.25
+    return min(max(duration * 0.10, 1.0), 30.0, duration - 0.1)
+
+
+def build_cover_command(
+    ffmpeg: str,
+    source: Path,
+    destination: Path,
+    timestamp: float | None,
+) -> list[str]:
+    command = [ffmpeg, "-hide_banner", "-y"]
+    if timestamp is not None and timestamp > 0:
+        command.extend(["-ss", f"{timestamp:.3f}"])
+    command.extend(
+        [
+            "-i",
+            str(source),
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-vf",
+            (
+                f"scale={COVER_WIDTH}:{COVER_HEIGHT}:force_original_aspect_ratio=decrease:"
+                "flags=lanczos,"
+                f"pad={COVER_WIDTH}:{COVER_HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1"
+            ),
+            "-pix_fmt",
+            "yuvj420p",
+            "-q:v",
+            "3",
+            "-update",
+            "1",
+            str(destination),
+        ]
+    )
+    return command
+
+
+def build_attach_cover_command(
+    ffmpeg: str,
+    source: Path,
+    cover: Path,
+    destination: Path,
+    attachment_index: int,
+) -> list[str]:
+    return [
+        ffmpeg,
+        "-hide_banner",
+        "-y",
+        "-i",
+        str(source),
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-attach",
+        str(cover),
+        f"-metadata:s:t:{attachment_index}",
+        "mimetype=image/jpeg",
+        f"-metadata:s:t:{attachment_index}",
+        "filename=cover.jpg",
+        str(destination),
+    ]
+
+
 def preflight_encoder(
     ffmpeg: str,
     source: Path,
@@ -650,6 +724,7 @@ def validate_output(
     expected_audio_count: int,
     expected_subtitle_count: int,
     expected_fps: Fraction,
+    require_cover: bool,
 ) -> dict[str, Any]:
     payload = json.loads(
         run_capture(
@@ -658,7 +733,15 @@ def validate_output(
         )
     )
     streams = payload.get("streams") or []
-    video = next((item for item in streams if item.get("codec_type") == "video"), None)
+    video = next(
+        (
+            item
+            for item in streams
+            if item.get("codec_type") == "video"
+            and not int((item.get("disposition") or {}).get("attached_pic") or 0)
+        ),
+        None,
+    )
     if not video or video.get("codec_name") != "h264":
         raise TranscodeError("Output validation failed: video is not H.264.")
     if video.get("profile") != "High" or int(video.get("level") or 0) not in {31, 32}:
@@ -696,6 +779,30 @@ def validate_output(
     format_names = str((payload.get("format") or {}).get("format_name") or "")
     if "matroska" not in format_names:
         raise TranscodeError("Output validation failed: output container is not Matroska.")
+    if require_cover:
+        cover = next(
+            (
+                item
+                for item in streams
+                if item.get("codec_type") == "video"
+                and int((item.get("disposition") or {}).get("attached_pic") or 0)
+                and item.get("codec_name") == "mjpeg"
+                and str((item.get("tags") or {}).get("filename") or "").lower()
+                == "cover.jpg"
+                and str((item.get("tags") or {}).get("mimetype") or "").lower()
+                == "image/jpeg"
+            ),
+            None,
+        )
+        if cover is None:
+            raise TranscodeError("Output validation failed: embedded cover.jpg is missing.")
+        if (
+            int(cover.get("width") or 0) != COVER_WIDTH
+            or int(cover.get("height") or 0) != COVER_HEIGHT
+        ):
+            raise TranscodeError(
+                "Output validation failed: embedded cover has an unexpected resolution."
+            )
     return payload
 
 
@@ -711,6 +818,7 @@ def print_summary(
     plan: EncoderPlan,
     target_bps: int,
     maxrate_bps: int,
+    cover_description: str,
 ) -> None:
     print("\nVitaMediaDeck conversion plan")
     print(f"  Input:       {info.video_codec}, {info.width}x{info.height}, {float(info.fps):.3f} fps")
@@ -721,6 +829,7 @@ def print_summary(
     print(f"  Video rate:  {target_bps / 1_000_000:.1f} Mb/s target, {maxrate_bps / 1_000_000:.1f} Mb/s max")
     print(f"  Audio:       {info.audio_stream_count} AAC-LC stereo 48 kHz track(s)")
     print(f"  Subtitles:   {len(info.subtitle_codecs)} preserved track(s)")
+    print(f"  Cover:       {cover_description}")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
@@ -770,6 +879,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg executable or path")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable or path")
+    cover_group = parser.add_mutually_exclusive_group()
+    cover_group.add_argument(
+        "--cover-image",
+        type=Path,
+        help="use this image for the embedded cover instead of extracting a video frame",
+    )
+    cover_group.add_argument(
+        "--no-cover",
+        action="store_true",
+        help="do not generate and embed cover.jpg (enabled by default)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
     parser.add_argument("--dry-run", action="store_true", help="inspect and print the command only")
     return parser.parse_args(argv)
@@ -792,6 +912,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         if output.exists() and not args.overwrite:
             raise TranscodeError(f"Output already exists (use --overwrite): {output}")
+        custom_cover = args.cover_image.expanduser().resolve() if args.cover_image else None
+        if custom_cover is not None and not custom_cover.is_file():
+            raise TranscodeError(f"Cover image not found: {custom_cover}")
+        cover_enabled = not args.no_cover
         if args.audio_bitrate < 64 or args.audio_bitrate > 320:
             raise TranscodeError("--audio-bitrate must be between 64 and 320 kb/s.")
         max_fps = fraction_from_text(args.max_fps)
@@ -852,9 +976,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise TranscodeError("Every available H.264 encoder failed its one-second preflight.")
 
         target_bps, maxrate_bps, _ = bitrate_plan(width, height, fps, args.quality)
-        print_summary(info, width, height, fps, plan, target_bps, maxrate_bps)
+        if custom_cover is not None:
+            cover_description = f"embedded JPEG from {custom_cover.name}"
+        elif cover_enabled:
+            cover_description = "embedded JPEG from a representative frame"
+        else:
+            cover_description = "disabled"
+        print_summary(
+            info,
+            width,
+            height,
+            fps,
+            plan,
+            target_bps,
+            maxrate_bps,
+            cover_description,
+        )
 
         temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
+        cover_file = output.with_name(f".{output.stem}.cover.jpg")
+        covered_temporary = output.with_name(f".{output.stem}.covered.partial{output.suffix}")
         command = build_command(
             ffmpeg,
             source,
@@ -874,12 +1015,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print("\nCommand:")
         print(command_text(command))
+        if cover_enabled:
+            cover_source = custom_cover or temporary
+            cover_timestamp = (
+                None if custom_cover is not None else representative_timestamp(info.duration)
+            )
+            cover_command = build_cover_command(
+                ffmpeg,
+                cover_source,
+                cover_file,
+                cover_timestamp,
+            )
+            attach_command = build_attach_cover_command(
+                ffmpeg,
+                temporary,
+                cover_file,
+                covered_temporary,
+                info.attachment_count,
+            )
+            print("\nCover command:")
+            print(command_text(cover_command))
+            print("\nCover attachment command:")
+            print(command_text(attach_command))
         if args.dry_run:
             return 0
 
         output.parent.mkdir(parents=True, exist_ok=True)
-        if temporary.exists():
-            temporary.unlink()
+        for work_file in (temporary, cover_file, covered_temporary):
+            if work_file.exists():
+                work_file.unlink()
         try:
             result = subprocess.run(command, check=False)
             if result.returncode != 0:
@@ -892,12 +1056,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                 info.audio_stream_count,
                 len(info.subtitle_codecs),
                 fps,
+                False,
             )
-            os.replace(temporary, output)
-        except BaseException:
-            if temporary.exists():
-                temporary.unlink()
-            raise
+            final_temporary = temporary
+            if cover_enabled:
+                result = subprocess.run(cover_command, check=False)
+                if result.returncode != 0 or not cover_file.is_file():
+                    raise TranscodeError("FFmpeg could not generate the cover image.")
+                result = subprocess.run(attach_command, check=False)
+                if result.returncode != 0 or not covered_temporary.is_file():
+                    raise TranscodeError("FFmpeg could not embed the cover image.")
+                validate_output(
+                    ffprobe,
+                    covered_temporary,
+                    info.audio_stream_count,
+                    len(info.subtitle_codecs),
+                    fps,
+                    True,
+                )
+                final_temporary = covered_temporary
+            os.replace(final_temporary, output)
+        finally:
+            for work_file in (temporary, cover_file, covered_temporary):
+                if work_file.exists():
+                    work_file.unlink()
 
         print(f"\nReady: {output}")
         return 0
