@@ -49,6 +49,14 @@ On macOS, Homebrew's `ffmpeg-full` is detected automatically when installed.
 brew install ffmpeg-full
 ```
 
+## Troubleshooting
+
+If FFprobe reports an error such as `0x00 at pos 0 invalid as first byte of an
+EBML number`, the selected file is not a valid Matroska file at byte zero. It
+is normally a corrupt or incomplete copy, not a missing FFmpeg dependency.
+Select the actual video rather than a macOS `._` sidecar file, then copy or
+download the source again before converting it.
+
 ## Quick start
 
 Convert a video with the recommended Vita profile:
