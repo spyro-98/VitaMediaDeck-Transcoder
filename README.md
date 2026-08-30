@@ -94,6 +94,22 @@ py -m pip install -r requirements-tui.txt
 py vitamediadeck_tui.py
 ```
 
+### Windows executable
+
+Every published GitHub release includes `VitaMediaDeck-Transcoder.exe`, a
+console executable that opens the terminal interface directly. FFmpeg and
+FFprobe remain external dependencies: install them and make both available on
+`PATH` before launching the executable.
+
+To build it locally on Windows:
+
+```powershell
+py -m pip install -r requirements-tui.txt pyinstaller
+powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```
+
+The output is `artifacts\windows\VitaMediaDeck-Transcoder.exe`.
+
 ## Terminal interface
 
 The TUI includes a file browser, input/output inspection, encoder and quality
