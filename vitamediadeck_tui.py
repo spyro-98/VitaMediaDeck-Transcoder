@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 try:
+    import psutil
+except ImportError:  # Optional outside Windows; required by requirements-tui.txt there.
+    psutil = None
+
+try:
     import curses
 except ImportError as exc:  # pragma: no cover - exercised on Windows without windows-curses
     raise SystemExit(
@@ -348,6 +353,8 @@ class TerminalApp:
         self.logs: deque[str] = deque(maxlen=4000)
         self.events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.process: subprocess.Popen[str] | None = None
+        self.paused = False
+        self.suspended_processes: list[Any] = []
         self.worker: threading.Thread | None = None
         self.progress_seconds: float | None = None
         self.live = LiveProgress()
@@ -554,6 +561,11 @@ class TerminalApp:
                 width,
             )
             return
+        if self.paused:
+            ratio_text = f"{self.live.overall_ratio * 100:05.1f}%"
+            line = f"Ⅱ PAUSED  [◴]{'─' * max(5, width - 31)}[◴]  {ratio_text}"
+            self.add(y, left, line, self.color(7) | curses.A_BOLD, width)
+            return
         reel_frames = ("◴", "◷", "◶", "◵")
         step = (self.frame // 2) % len(reel_frames)
         left_reel = reel_frames[step]
@@ -628,10 +640,10 @@ class TerminalApp:
             self.screen.refresh()
             return
         active = bool(self.process and self.process.poll() is None)
-        state = "CONVERTING" if active else "READY"
+        state = "PAUSED" if active and self.paused else "CONVERTING" if active else "READY"
         self.add(0, 2, "△ VITA MEDIA DECK", self.color(13) | curses.A_BOLD)
         self.add(0, 22, "VIDEO TRANSCODER", self.color(8))
-        state_style = self.color(11) if active else self.color(13)
+        state_style = self.color(7) if self.paused else self.color(11) if active else self.color(13)
         self.add(0, width - len(state) - 5, f"◈ {state}", state_style | curses.A_BOLD)
         self.signal_carrier(1, 1, width - 3)
         source_name = self.input_path.name if self.input_path else "NO INPUT SELECTED"
@@ -664,7 +676,11 @@ class TerminalApp:
         self.add(height - 4, 2, "◢ STATUS", status_style | curses.A_BOLD)
         self.add(height - 4, 11, self.status.upper(), status_style, width - 13)
         self.signal_carrier(height - 2, 1, width - 3)
-        footer = " O INPUT  U OUTPUT  I ANALYZE  R TRANSCODE  C ABORT  TAB VIEW  Q EXIT "
+        footer = (
+            " O INPUT  U OUTPUT  I ANALYZE  R TRANSCODE  P PAUSE/RESUME  C ABORT  TAB VIEW  Q EXIT "
+            if width >= 108
+            else " O IN  U OUT  I SCAN  R RUN  P PAUSE  C STOP  TAB VIEW  Q EXIT "
+        )
         self.fill(height - 1, 0, width - 1, self.color(6))
         self.add(height - 1, 2, footer, self.color(6) | curses.A_BOLD, width - 4)
         self.screen.refresh()
@@ -1288,11 +1304,20 @@ class TerminalApp:
         if not lines:
             lines = ["NO CONVERSION LOG YET  ·  PRESS R TO START"]
         active = bool(self.process and self.process.poll() is None)
+        animating = active and not self.paused
         self.add(top, left, "◢ CONVERSION LOG", self.color(13) | curses.A_BOLD, width)
-        self.draw_particle_strip(top, left, width, active)
+        self.draw_particle_strip(top, left, width, animating)
         self.draw_phase_rail(top + 1, left, width)
         self.tape_transport(top + 2, left, width, active)
-        if active:
+        if active and self.paused:
+            self.add(
+                top + 3,
+                left,
+                f"PAUSED › {self.live.phase_label}  ·  PRESS P TO RESUME",
+                self.color(7) | curses.A_BOLD,
+                width,
+            )
+        elif active:
             self.add(
                 top + 3,
                 left,
@@ -1397,6 +1422,8 @@ class TerminalApp:
             self.probe_current()
         elif key in (ord("r"), ord("R")):
             self.start_conversion()
+        elif key in (ord("p"), ord("P")):
+            self.toggle_pause()
         elif key in (ord("c"), ord("C")):
             self.cancel_conversion()
         elif self.tab == 1:
@@ -1640,6 +1667,8 @@ class TerminalApp:
         self.logs.append("$ " + core.command_text(command))
         self.progress_seconds = None
         self.live = LiveProgress(started_at=time.monotonic())
+        self.paused = False
+        self.suspended_processes.clear()
         self.tab = 4
         self.status = "Starting conversion..."
         self.worker = threading.Thread(target=self.conversion_worker, args=(command,), daemon=True)
@@ -1690,7 +1719,11 @@ class TerminalApp:
             except queue.Empty:
                 return
             if kind == "started":
-                self.status = f"Conversion running (PID {value})..."
+                self.status = (
+                    "Conversion paused. Press P to resume or C to cancel."
+                    if self.paused
+                    else f"Conversion running (PID {value})..."
+                )
             elif kind == "line":
                 line = str(value)
                 if line.startswith(core.PROGRESS_PREFIX):
@@ -1705,6 +1738,8 @@ class TerminalApp:
                     self.update_ffmpeg_stats(line)
             elif kind == "done":
                 self.process = None
+                self.paused = False
+                self.suspended_processes.clear()
                 if value == 0:
                     self.live.phase = "complete"
                     self.live.phase_label = "COMPLETE"
@@ -1717,6 +1752,8 @@ class TerminalApp:
                     self.status = f"Conversion failed with exit status {value}. See Log."
             elif kind == "failure":
                 self.process = None
+                self.paused = False
+                self.suspended_processes.clear()
                 self.logs.append(f"Error: {value}")
                 self.status = f"Could not start conversion: {value}"
 
@@ -1803,6 +1840,11 @@ class TerminalApp:
         self.status = self.progress_status()
 
     def progress_status(self) -> str:
+        if self.paused:
+            return (
+                f"PAUSED: {self.live.phase_label} {self.live.phase_ratio * 100:.1f}%"
+                f" · OVERALL {self.live.overall_ratio * 100:.1f}% · PRESS P TO RESUME"
+            )
         detail = f" · {self.live.detail}" if self.live.detail else ""
         return (
             f"{self.live.phase_label}: {self.live.phase_ratio * 100:.1f}%"
@@ -1838,6 +1880,8 @@ class TerminalApp:
             self.status = "No conversion is running."
             return
         try:
+            if self.paused:
+                self.resume_conversion(update_status=False)
             if os.name == "nt":
                 ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
                 if ctrl_break is not None:
@@ -1849,6 +1893,78 @@ class TerminalApp:
             self.status = "Cancellation requested..."
         except OSError as exc:
             self.status = f"Could not cancel conversion: {exc}"
+
+    def toggle_pause(self) -> None:
+        process = self.process
+        if not process or process.poll() is not None:
+            self.status = "No conversion is running."
+            return
+        if self.paused:
+            self.resume_conversion()
+        else:
+            self.pause_conversion()
+
+    def pause_conversion(self) -> None:
+        process = self.process
+        if not process or process.poll() is not None or self.paused:
+            return
+        try:
+            if os.name == "nt":
+                if psutil is None:
+                    raise RuntimeError(
+                        "Pause on Windows requires psutil; install requirements-tui.txt."
+                    )
+                parent = psutil.Process(process.pid)
+                targets = [*reversed(parent.children(recursive=True)), parent]
+                suspended: list[Any] = []
+                try:
+                    for target in targets:
+                        target.suspend()
+                        suspended.append(target)
+                except Exception:
+                    for target in suspended:
+                        try:
+                            target.resume()
+                        except Exception:
+                            pass
+                    raise
+                self.suspended_processes = suspended
+            else:
+                os.killpg(process.pid, signal.SIGSTOP)
+            self.paused = True
+            self.live.eta_seconds = None
+            self.logs.append("Conversion paused by user.")
+            self.status = "Conversion paused. Press P to resume or C to cancel."
+        except (OSError, RuntimeError) as exc:
+            self.status = f"Could not pause conversion: {exc}"
+        except Exception as exc:
+            self.status = f"Could not pause conversion: {exc}"
+
+    def resume_conversion(self, update_status: bool = True) -> None:
+        process = self.process
+        if not process or process.poll() is not None or not self.paused:
+            return
+        try:
+            if os.name == "nt":
+                for target in self.suspended_processes:
+                    try:
+                        target.resume()
+                    except Exception as exc:
+                        if psutil is None or not isinstance(
+                            exc, (psutil.NoSuchProcess, psutil.ZombieProcess)
+                        ):
+                            raise
+                self.suspended_processes.clear()
+            else:
+                os.killpg(process.pid, signal.SIGCONT)
+            self.paused = False
+            if update_status:
+                self.logs.append("Conversion resumed by user.")
+                self.status = f"Conversion resumed: {self.progress_status()}"
+        except OSError as exc:
+            self.status = f"Could not resume conversion: {exc}"
+        except Exception as exc:
+            self.status = f"Could not resume conversion: {exc}"
 
     def prompt(self, title: str, initial: str) -> str | None:
         value = list(initial)

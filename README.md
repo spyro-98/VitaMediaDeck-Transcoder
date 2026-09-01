@@ -8,26 +8,42 @@ host tool: it is not included in the VPK.
 
 ![VitaMediaDeck Transcoder conversion log](docs/images/tui-conversion.png)
 
-## What it produces
+## Input and output formats
 
-FFmpeg-compatible input files are converted to a seekable Matroska file with:
+Input support is provided by the installed FFmpeg build rather than a fixed
+extension allowlist. Any file containing a video stream that FFmpeg and
+FFprobe can decode can be inspected and converted. Audio-only files are not
+accepted by this video transcoder.
 
-- H.264 High Profile, Level 3.1 up to 30 fps or Level 3.2 above 30 fps;
-- a 960×544 PS Vita canvas with preserved aspect ratio and padding if needed;
-- 8-bit BT.709 `yuv420p` video at the source frame rate, up to 60 fps; it
-  never creates extra frames above the source cadence;
-- every selected source audio track re-encoded as supported AAC-LC mono/stereo
-  at 48 kHz, with its target bitrate capped at the measured source-track
-  bitrate;
-- selected subtitle tracks, chapters, language/title metadata, and compatible
-  Matroska font attachments;
-- an embedded 480×272 `cover.jpg`, using existing artwork first and a bounded
-  representative video window as fallback. Near-black artwork is rejected and
-  retried at a distant timestamp so it remains visible on the Vita OLED theme.
+Common supported inputs include:
 
-Matroska is deliberate: unlike MP4, it can retain formats such as ASS, PGS,
-VobSub, and subtitle-font attachments. VitaMediaDeck demuxes H.264/AAC from
-Matroska through either playback backend.
+| Type | Representative formats |
+| --- | --- |
+| Containers | Matroska/WebM (`.mkv`, `.webm`), MP4/M4V/MOV, AVI, MPEG-TS/M2TS, MPEG/VOB, WMV/ASF, FLV, OGV and 3GP |
+| Video | H.264/AVC, H.265/HEVC including 10-bit HDR, AV1, VP8/VP9, MPEG-1/2, MPEG-4 Part 2/DivX/Xvid, VC-1/WMV, ProRes and DNxHD/DNxHR |
+| Audio inside the video | AAC/HE-AAC, MP3, AC-3, E-AC-3, DTS, TrueHD/MLP, FLAC, ALAC, Opus, Vorbis, PCM/WAV and WMA |
+| Embedded subtitles | SRT/SubRip, ASS/SSA, WebVTT, MOV text, PGS and VobSub/DVD subtitles |
+
+This list is representative rather than exhaustive. A format is available
+only when the selected FFmpeg build contains its demuxer and decoder. Use a
+full FFmpeg build for the widest input coverage.
+
+Every successful conversion has one predictable VitaMediaDeck contract:
+
+| Output component | Format |
+| --- | --- |
+| Container | Seekable Matroska (`.mkv`) |
+| Video | H.264 High Profile, Level 3.1 up to 30 fps or Level 3.2 above 30 fps |
+| Image | 960×544 canvas, preserved aspect ratio, 8-bit `yuv420p`, BT.709 limited range |
+| Frame rate | Original source cadence, never increased, capped at 60 fps |
+| Audio | Every selected track converted to AAC-LC, mono/stereo, 48 kHz; target bitrate never exceeds the measured source-track bitrate |
+| Subtitles | Selected compatible embedded tracks retained; MOV text, generic text and WebVTT are converted to SRT |
+| Metadata | Chapters, language/title metadata and compatible Matroska font attachments retained |
+| Cover | Embedded 480×272 `cover.jpg`; existing artwork has priority, otherwise a representative frame is generated |
+
+Matroska is deliberate: unlike MP4, it can retain ASS, PGS, VobSub and subtitle
+font attachments alongside multiple audio tracks. Near-black generated artwork
+is rejected and retried at a distant timestamp.
 
 ## Requirements
 
@@ -91,7 +107,8 @@ python3 vitamediadeck_tui.py input.mkv output.vitamediadeck.mkv
 python3 vitamediadeck_tui.py input.mkv --preset "Balanced"
 ```
 
-On Windows only, install the `curses` compatibility package once:
+On Windows only, install the TUI dependencies once. They provide the `curses`
+compatibility layer and process-tree pause/resume support:
 
 ```powershell
 py -m pip install -r requirements-tui.txt
@@ -118,17 +135,23 @@ The output is `artifacts\windows\VitaMediaDeck-Transcoder.exe`.
 
 The TUI includes a file browser, input/output inspection, encoder and quality
 settings, editable presets, per-track audio/subtitle selection, live FFmpeg
-logs, progress, speed, bitrate, ETA, cancellation, and final validation.
+logs, progress, speed, bitrate, ETA, process-level pause/resume, cancellation,
+and final validation.
 
 | Key | Action |
 | --- | --- |
 | `O` / `U` | Select input / edit output path |
 | `I` / `R` / `C` | Analyze / start / cancel conversion |
+| `P` | Pause or resume the complete transcoding process tree |
 | `Tab`, `Shift+Tab`, `1`–`5` | Change page |
 | Arrow keys, `Space` | Navigate and toggle a selected stream |
 | `A`, `S`, `X` | Select all audio, all subtitles, or clear a stream type |
 | `N`, `D` | Save or delete a custom preset |
 | `Q` | Quit |
+
+Pause suspends the complete transcoder/FFmpeg process tree, so CPU/GPU work and
+output generation stop until `P` is pressed again. A paused conversion can be
+cancelled safely with `C`.
 
 ## Quality, HDR, and system load
 
