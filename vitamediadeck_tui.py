@@ -71,6 +71,7 @@ PHASE_SHORT = {
 class Settings:
     encoder: str = "auto"
     quality: str = "high"
+    content_tune: str = "movie"
     max_fps: str = "60"
     audio_bitrate: int = 192
     system_load: str = "balanced"
@@ -107,6 +108,8 @@ class Settings:
             self.encoder,
             "--quality",
             self.quality,
+            "--content-tune",
+            self.content_tune,
             "--max-fps",
             self.max_fps,
             "--audio-bitrate",
@@ -167,6 +170,9 @@ class LiveProgress:
 
 BUILTIN_PRESETS: dict[str, Settings] = {
     "Vita Perceptual Max": Settings(),
+    "Vita Movie Max": Settings(encoder="x264", content_tune="movie"),
+    "Vita Anime Max": Settings(encoder="x264", content_tune="anime"),
+    "Vita Anime Grain": Settings(encoder="x264", content_tune="anime-grain"),
     "Balanced": Settings(quality="balanced"),
     "Compact 30 fps": Settings(quality="compact", max_fps="30", audio_bitrate=160),
     "Software Compatibility": Settings(encoder="x264", hw_decode=False),
@@ -276,6 +282,7 @@ class TerminalApp:
     SETTING_ROWS = (
         ("Encoder", "encoder", ("auto", "videotoolbox", "nvenc", "amf", "vaapi", "x264")),
         ("Quality", "quality", ("high", "balanced", "compact")),
+        ("Content tuning", "content_tune", core.CONTENT_TUNES),
         ("Maximum FPS", "max_fps", ("60", "60000/1001", "50", "30", "30000/1001", "25", "24", "24000/1001")),
         ("Audio bitrate", "audio_bitrate", (128, 160, 192, 256, 320)),
         ("System load", "system_load", ("low", "balanced", "full")),
@@ -292,8 +299,9 @@ class TerminalApp:
     SETTING_HELP = {
         "encoder": "Select the H.264 engine. AUTO probes hardware first and falls back safely.",
         "quality": "Controls the target bitrate envelope: HIGH, BALANCED, or COMPACT.",
+        "content_tune": "MOVIE uses x264 film; ANIME protects line art; ANIME-GRAIN preserves analog grain.",
         "max_fps": "Preserves source cadence up to this ceiling. Vita output never exceeds 60 fps.",
-        "audio_bitrate": "AAC-LC bitrate applied independently to every retained audio track.",
+        "audio_bitrate": "AAC-LC ceiling per track; output never targets more than the measured source rate.",
         "system_load": "BALANCED leaves two CPU cores free (up to 8 threads); LOW uses 2; FULL is unlimited.",
         "tone_map": "HDR-to-SDR curve. MOBIUS is neutral; HABLE protects highlights.",
         "force_hdr": "Treat untagged input as HDR and force the SDR tone-mapping pipeline.",
@@ -745,6 +753,7 @@ class TerminalApp:
             output_height,
             fps,
             self.settings.quality,
+            self.settings.content_tune,
         )
         engine = self.settings.encoder.upper()
         if self.capabilities:
@@ -851,16 +860,15 @@ class TerminalApp:
                 self.add(
                     auxiliary_row,
                     left + 3,
-                    f"{self.settings.quality.upper()}  ·  {cover}  ·  "
+                    f"{self.settings.quality.upper()}  ·  {self.settings.content_tune.upper()}  ·  {cover}  ·  "
                     f"A{len(self.selected_audio_tracks):02d} S{len(self.selected_subtitle_tracks):02d}",
                     self.color(8),
                     inner,
                 )
         if estimate_row < top + height - 1:
             duration = self.info.duration or 0
-            estimate = duration * (
-                target + len(self.selected_audio_tracks) * self.settings.audio_bitrate * 1000
-            ) / 8
+            audio_bitrates = self.selected_audio_bitrates()
+            estimate = duration * (target + sum(audio_bitrates) * 1000) / 8
             self.add(estimate_row, left + 3, f"ESTIMATED SIZE › {bytes_text(estimate)}", self.color(7), inner)
 
     def overview_lines(self) -> list[tuple[str, str, int]]:
@@ -994,7 +1002,13 @@ class TerminalApp:
         max_fps = core.fraction_from_text(self.settings.max_fps) or core.MAX_FPS
         fps = core.target_fps(self.info.fps, max_fps)
         width, height = core.fitted_dimensions(self.info)
-        target, maximum, _ = core.bitrate_plan(width, height, fps, self.settings.quality)
+        target, maximum, _ = core.bitrate_plan(
+            width,
+            height,
+            fps,
+            self.settings.quality,
+            self.settings.content_tune,
+        )
         if self.settings.cover_mode == "auto":
             cover = (
                 f"reuse {self.info.cover_name}"
@@ -1016,12 +1030,21 @@ class TerminalApp:
             except core.TranscodeError as exc:
                 encoders = str(exc)
         duration = self.info.duration or 0
-        estimated = duration * (
-            target + len(self.selected_audio_tracks) * self.settings.audio_bitrate * 1000
-        ) / 8
+        audio_bitrates = self.selected_audio_bitrates()
+        estimated = duration * (target + sum(audio_bitrates) * 1000) / 8
+        tuning_detail = (
+            f"x264 tune={core.X264_CONTENT_TUNES[self.settings.content_tune]}"
+            if self.settings.encoder == "x264"
+            else f"{self.settings.content_tune} bitrate curve · hardware-native HQ"
+        )
         return [
             ("Output profile", f"H.264 High, {width}x{height}, {float(fps):.3f} fps", self.color(3)),
             ("Video bitrate", f"{target / 1_000_000:.1f} Mb/s target, {maximum / 1_000_000:.1f} Mb/s max", 0),
+            (
+                "Content tuning",
+                tuning_detail,
+                self.color(3),
+            ),
             (
                 "System load",
                 f"{self.settings.system_load}; "
@@ -1034,8 +1057,8 @@ class TerminalApp:
             ),
             (
                 "Audio output",
-                f"{len(self.selected_audio_tracks)}/{self.info.audio_stream_count} selected x "
-                f"AAC-LC stereo 48 kHz @ {self.settings.audio_bitrate} kb/s",
+                f"{len(self.selected_audio_tracks)}/{self.info.audio_stream_count} selected · "
+                f"AAC-LC stereo 48 kHz @ {', '.join(f'{rate} kb/s' for rate in audio_bitrates) or 'none'}",
                 0,
             ),
             (
@@ -1048,6 +1071,15 @@ class TerminalApp:
             ("Encoder order", encoders, 0),
             ("Estimated size", (bytes_text(estimated) + " (duration x total bitrate)") if duration else "unknown duration", curses.A_DIM),
         ]
+
+    def selected_audio_bitrates(self) -> tuple[int, ...]:
+        if not self.info:
+            return ()
+        return core.target_audio_bitrates(
+            self.info,
+            sorted(self.selected_audio_tracks),
+            self.settings.audio_bitrate,
+        )
 
     @staticmethod
     def rate_text(value: Any) -> str:
@@ -1232,12 +1264,24 @@ class TerminalApp:
         self.add(top, left, "◢ PRESETS", self.color(1) | curses.A_BOLD, width)
         self.add(top + 1, left, "ENTER APPLY  ·  N SAVE CURRENT  ·  D DELETE CUSTOM PRESET", self.color(8), width)
         self.add(top + 2, left, f"PRESET FILE › {self.presets.path}", self.color(7), width)
-        for visible, (name, custom, _) in enumerate(rows[offset : offset + max(0, height - 3)]):
+        for visible, (name, custom, settings) in enumerate(rows[offset : offset + max(0, height - 3)]):
             index = offset + visible
             marker = "CUSTOM" if custom else "BUILT-IN"
             style = self.color(2) | curses.A_BOLD if index == self.preset_index else 0
             selector = "◇" if index == self.preset_index else "·"
-            self.add(top + 3 + visible, left, f"{selector} M{index + 1:02d}  {name.upper():<32}  ‹{marker}›", style, width)
+            tuning = (
+                core.X264_CONTENT_TUNES[settings.content_tune].upper()
+                if settings.encoder == "x264"
+                else f"{settings.content_tune.upper()} / HW HQ"
+            )
+            self.add(
+                top + 3 + visible,
+                left,
+                f"{selector} M{index + 1:02d}  {name.upper():<28}  "
+                f"‹{marker} · {tuning}›",
+                style,
+                width,
+            )
 
     def draw_log(self, top: int, left: int, height: int, width: int) -> None:
         lines = list(self.logs)

@@ -21,7 +21,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Sequence
@@ -31,6 +31,10 @@ OUTPUT_WIDTH = 960
 OUTPUT_HEIGHT = 544
 COVER_WIDTH = 480
 COVER_HEIGHT = 272
+VITA_AUDIO_CODEC = "aac"
+VITA_AUDIO_PROFILE = "LC"
+VITA_AUDIO_SAMPLE_RATE = 48_000
+VITA_AUDIO_MAX_CHANNELS = 2
 COVER_THUMBNAIL_WINDOW_FRAMES = 120
 COVER_BLACK_YAVG_MAX = 10.0
 COVER_BLACK_YMAX_MAX = 32.0
@@ -48,6 +52,12 @@ QUALITY_LIMITS = {
     "compact": (1_400_000, 4_000_000),
     "balanced": (1_800_000, 5_000_000),
     "high": (2_400_000, 6_000_000),
+}
+CONTENT_TUNES = ("movie", "anime", "anime-grain")
+X264_CONTENT_TUNES = {
+    "movie": "film",
+    "anime": "animation",
+    "anime-grain": "grain",
 }
 PROGRESS_PREFIX = "@@VMD_PROGRESS@@"
 PREFLIGHT_SECONDS = 3.0
@@ -114,6 +124,8 @@ class MediaInfo:
     color_space: str
     audio_stream_count: int
     audio_stream_indices: tuple[int, ...]
+    audio_bit_rates: tuple[int | None, ...]
+    audio_durations: tuple[float | None, ...]
     subtitle_codecs: tuple[str, ...]
     subtitle_stream_indices: tuple[int, ...]
     attachment_count: int
@@ -486,9 +498,6 @@ def probe_media(ffprobe: str, source: Path, force_hdr: bool) -> MediaInfo:
     )
     field_order = str(video.get("field_order") or "").lower()
     interlaced = field_order not in {"", "unknown", "progressive"}
-    if interlaced and fps <= Fraction(31, 1):
-        fps = normalize_fps(fps * 2)
-
     color_transfer = str(video.get("color_transfer") or "unknown").lower()
     color_primaries = str(video.get("color_primaries") or "unknown").lower()
     color_space = str(video.get("color_space") or "unknown").lower()
@@ -530,6 +539,16 @@ def probe_media(ffprobe: str, source: Path, force_hdr: bool) -> MediaInfo:
         audio_stream_count=sum(item.get("codec_type") == "audio" for item in streams),
         audio_stream_indices=tuple(
             int(item.get("index") or 0)
+            for item in streams
+            if item.get("codec_type") == "audio"
+        ),
+        audio_bit_rates=tuple(
+            stream_bit_rate(item)
+            for item in streams
+            if item.get("codec_type") == "audio"
+        ),
+        audio_durations=tuple(
+            stream_duration(item)
             for item in streams
             if item.get("codec_type") == "audio"
         ),
@@ -606,22 +625,116 @@ def target_fps(source_fps: Fraction, max_fps: Fraction) -> Fraction:
     return chosen.limit_denominator(100_000)
 
 
-def bitrate_plan(width: int, height: int, fps: Fraction, quality: str) -> tuple[int, int, int]:
+def target_audio_bitrates(
+    info: MediaInfo,
+    selected_audio_tracks: Sequence[int],
+    requested_kbps: int,
+) -> tuple[int, ...]:
+    """Keep each AAC target at or below the source bitrate when it is known.
+
+    Matroska and some variable-bitrate codecs do not always expose a per-stream
+    bitrate through ffprobe.  In that case the explicitly selected bitrate is
+    retained, rather than guessing a possibly incorrect value.
+    """
+    targets: list[int] = []
+    for ordinal in selected_audio_tracks:
+        source_bps = info.audio_bit_rates[ordinal]
+        source_kbps = source_bps // 1000 if source_bps else None
+        targets.append(min(requested_kbps, source_kbps) if source_kbps else requested_kbps)
+    return tuple(targets)
+
+
+def measured_audio_bit_rate(
+    ffprobe: str,
+    source: Path,
+    audio_ordinal: int,
+    duration: float | None,
+) -> int | None:
+    """Measure a stream when containers omit its bitrate metadata.
+
+    FFprobe does not publish `bit_rate` for many Matroska audio tracks.  Packet
+    sizes divided by the audio stream duration provide the actual average rate
+    without relying on the container's overall bitrate.
+    """
+    if duration is None or duration <= 0:
+        return None
+    try:
+        packet_sizes = run_capture(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-select_streams",
+                f"a:{audio_ordinal}",
+                "-show_packets",
+                "-show_entries",
+                "packet=size",
+                "-of",
+                "csv=p=0",
+                str(source),
+            ],
+            f"audio bitrate measurement for track {audio_ordinal}",
+        )
+    except TranscodeError:
+        return None
+    total_bytes = 0
+    for line in packet_sizes.splitlines():
+        try:
+            total_bytes += int(line.strip().split(",", 1)[0])
+        except ValueError:
+            continue
+    return int(total_bytes * 8 / duration) if total_bytes else None
+
+
+def resolved_audio_bitrates(
+    ffprobe: str,
+    source: Path,
+    info: MediaInfo,
+    selected_audio_tracks: Sequence[int],
+    requested_kbps: int,
+) -> tuple[int, ...]:
+    source_rates = list(info.audio_bit_rates)
+    for ordinal in selected_audio_tracks:
+        if source_rates[ordinal] is None:
+            source_rates[ordinal] = measured_audio_bit_rate(
+                ffprobe,
+                source,
+                ordinal,
+                info.audio_durations[ordinal] or info.duration,
+            )
+        if source_rates[ordinal] is None:
+            raise TranscodeError(
+                f"Cannot determine the bitrate of selected audio track {ordinal}. "
+                "The conversion stops rather than creating an audio stream above the source rate."
+            )
+    measured_info = replace(info, audio_bit_rates=tuple(source_rates))
+    return target_audio_bitrates(measured_info, selected_audio_tracks, requested_kbps)
+
+
+def bitrate_plan(
+    width: int,
+    height: int,
+    fps: Fraction,
+    quality: str,
+    content_tune: str = "movie",
+) -> tuple[int, int, int]:
     if quality == "high" and width == OUTPUT_WIDTH and height == OUTPUT_HEIGHT:
         cadence = float(fps)
         if cadence <= 24.1:
-            target = 2_400_000
+            targets = {"movie": 2_400_000, "anime": 2_200_000, "anime-grain": 2_800_000}
         elif cadence <= 30.1:
-            target = 2_800_000
+            targets = {"movie": 2_800_000, "anime": 2_600_000, "anime-grain": 3_200_000}
         elif cadence <= 50.1:
-            target = 5_000_000
+            targets = {"movie": 5_000_000, "anime": 4_500_000, "anime-grain": 5_500_000}
         else:
-            target = 5_600_000
+            targets = {"movie": 5_600_000, "anime": 5_200_000, "anime-grain": 6_000_000}
+        target = targets[content_tune]
         maxrate = 4_500_000 if cadence <= 30.1 else 8_000_000
         return target, maxrate, maxrate * 2
 
     minimum, maximum = QUALITY_LIMITS[quality]
     estimated = width * height * float(fps) * QUALITY_BPP[quality]
+    estimated *= {"movie": 1.0, "anime": 0.9, "anime-grain": 1.1}[content_tune]
     target = max(minimum, min(maximum, int(round(estimated / 100_000.0)) * 100_000))
     maxrate = min(14_000_000, int(round(target * 1.3 / 100_000.0)) * 100_000)
     return target, maxrate, maxrate * 2
@@ -644,7 +757,10 @@ def filter_chain(
     filters: list[str] = []
     content_width, content_height = content_dimensions(info)
     if info.interlaced:
-        filters.append("bwdif=mode=send_field:parity=auto:deint=interlaced")
+        # Do not double a 25/29.97 fps source to its field cadence.  The
+        # transcoder preserves the source frame rate by deinterlacing one
+        # output frame per input frame.
+        filters.append("bwdif=mode=send_frame:parity=auto:deint=interlaced")
 
     if info.hdr:
         if "zscale" not in capabilities.filters or "tonemap" not in capabilities.filters:
@@ -720,6 +836,7 @@ def encoder_arguments(
     maxrate_bps: int,
     bufsize_bps: int,
     gop: int,
+    content_tune: str,
 ) -> list[str]:
     args = [
         "-c:v",
@@ -799,8 +916,10 @@ def encoder_arguments(
             [
                 "-preset",
                 "slow",
+                "-tune",
+                X264_CONTENT_TUNES[content_tune],
                 "-crf",
-                "18",
+                "17.5" if content_tune == "anime" else "18",
                 "-bf",
                 "2",
                 "-refs",
@@ -822,6 +941,7 @@ def build_command(
     height: int,
     fps: Fraction,
     quality: str,
+    content_tune: str,
     audio_bitrate: int,
     tone_map: str,
     vaapi_device: Path,
@@ -830,8 +950,11 @@ def build_command(
     subtitle_tracks: Sequence[int] | None = None,
     system_load: str = "balanced",
     preserve_extras: bool = True,
+    audio_bitrates: Sequence[int] | None = None,
 ) -> list[str]:
-    target_bps, maxrate_bps, bufsize_bps = bitrate_plan(width, height, fps, quality)
+    target_bps, maxrate_bps, bufsize_bps = bitrate_plan(
+        width, height, fps, quality, content_tune
+    )
     level = h264_level(width, height, fps)
     gop = max(24, int(round(float(fps) * 2.0)))
 
@@ -894,6 +1017,7 @@ def build_command(
             maxrate_bps,
             bufsize_bps,
             gop,
+            content_tune,
         )
     )
     if thread_limit and encoder_key == "x264":
@@ -928,17 +1052,18 @@ def build_command(
             command.extend(
                 [
                     "-c:a",
-                    "aac",
+                    VITA_AUDIO_CODEC,
                     "-profile:a",
                     "aac_low",
-                    "-b:a",
-                    f"{audio_bitrate}k",
                     "-ac",
-                    "2",
+                    str(VITA_AUDIO_MAX_CHANNELS),
                     "-ar",
-                    "48000",
+                    str(VITA_AUDIO_SAMPLE_RATE),
                 ]
             )
+            audio_targets = audio_bitrates or tuple(audio_bitrate for _ in selected_audio)
+            for output_index, bitrate in enumerate(audio_targets):
+                command.extend([f"-b:a:{output_index}", f"{bitrate}k"])
             command.extend(["-af", audio_filter(info.duration)])
         for output_index, source_ordinal in enumerate(selected_subtitles):
             codec = info.subtitle_codecs[source_ordinal]
@@ -1097,7 +1222,7 @@ def build_audio_repair_command(
     ffmpeg: str,
     source: Path,
     destination: Path,
-    audio_bitrate: int,
+    audio_bitrates: Sequence[int],
     duration: float | None,
     audio_stream_indices: Sequence[int],
 ) -> list[str]:
@@ -1116,22 +1241,22 @@ def build_audio_repair_command(
         "-sn",
         "-dn",
         "-c:a",
-        "aac",
+        VITA_AUDIO_CODEC,
         "-profile:a",
         "aac_low",
-        "-b:a",
-        f"{audio_bitrate}k",
         "-ac",
-        "2",
+        str(VITA_AUDIO_MAX_CHANNELS),
         "-ar",
-        "48000",
+        str(VITA_AUDIO_SAMPLE_RATE),
         "-af",
         audio_filter(duration),
         "-map_metadata",
         "0",
-        str(destination),
         ]
     )
+    for output_index, bitrate in enumerate(audio_bitrates):
+        command.extend([f"-b:a:{output_index}", f"{bitrate}k"])
+    command.append(str(destination))
     return command
 
 
@@ -1188,6 +1313,7 @@ def preflight_encoder(
     height: int,
     fps: Fraction,
     quality: str,
+    content_tune: str,
     audio_bitrate: int,
     tone_map: str,
     vaapi_device: Path,
@@ -1207,6 +1333,7 @@ def preflight_encoder(
             height,
             fps,
             quality,
+            content_tune,
             audio_bitrate,
             tone_map,
             vaapi_device,
@@ -1265,6 +1392,7 @@ def fallback_video_plan(
     height: int,
     fps: Fraction,
     quality: str,
+    content_tune: str,
     audio_bitrate: int,
     tone_map: str,
     vaapi_device: Path,
@@ -1287,6 +1415,7 @@ def fallback_video_plan(
             height,
             fps,
             quality,
+            content_tune,
             audio_bitrate,
             tone_map,
             vaapi_device,
@@ -1361,11 +1490,14 @@ def validate_output(
     if len(audio_streams) != expected_audio_count:
         raise TranscodeError("Output validation failed: one or more audio tracks are missing.")
     for track_number, audio in enumerate(audio_streams, start=1):
-        if audio.get("codec_name") != "aac":
+        if str(audio.get("codec_name") or "").lower() != VITA_AUDIO_CODEC:
             raise TranscodeError("Output validation failed: an audio track is not AAC.")
-        if int(audio.get("channels") or 0) > 2:
-            raise TranscodeError("Output validation failed: an AAC track has more than two channels.")
-        if int(audio.get("sample_rate") or 0) != 48_000:
+        if str(audio.get("profile") or "").upper() != VITA_AUDIO_PROFILE:
+            raise TranscodeError("Output validation failed: an audio track is not AAC-LC.")
+        channels = int(audio.get("channels") or 0)
+        if channels < 1 or channels > VITA_AUDIO_MAX_CHANNELS:
+            raise TranscodeError("Output validation failed: an AAC track is not mono or stereo.")
+        if int(audio.get("sample_rate") or 0) != VITA_AUDIO_SAMPLE_RATE:
             raise TranscodeError("Output validation failed: an AAC track is not 48 kHz.")
         audio_duration = stream_duration(audio)
         if validate_audio_duration and duration_reference is not None:
@@ -1429,9 +1561,10 @@ def print_summary(
     height: int,
     fps: Fraction,
     plan: EncoderPlan,
+    content_tune: str,
     target_bps: int,
     maxrate_bps: int,
-    audio_bitrate: int,
+    audio_bitrates: Sequence[int],
     selected_audio_count: int,
     selected_subtitle_count: int,
     system_load: str,
@@ -1442,6 +1575,12 @@ def print_summary(
     print(f"  Color:       {'HDR -> BT.709 SDR' if info.hdr else 'SDR BT.709 output'}")
     print(f"  Output:      H.264 High, {width}x{height}, {float(fps):.3f} fps")
     print(f"  Encoder:     {plan.codec}")
+    tuning_detail = (
+        f"x264 tune={X264_CONTENT_TUNES[content_tune]}"
+        if plan.key == "x264"
+        else "content-specific bitrate curve; encoder-native HQ mode"
+    )
+    print(f"  Tuning:      {content_tune} ({tuning_detail})")
     if plan.hw_decode:
         decode_detail = "requested (FFmpeg may fall back)"
     elif info.hdr:
@@ -1460,7 +1599,7 @@ def print_summary(
     print(f"  Video rate:  {target_bps / 1_000_000:.1f} Mb/s target, {maxrate_bps / 1_000_000:.1f} Mb/s max")
     print(
         f"  Audio:       {selected_audio_count}/{info.audio_stream_count} selected; "
-        f"AAC-LC stereo 48 kHz at {audio_bitrate} kb/s each"
+        f"AAC-LC mono/stereo 48 kHz at {', '.join(f'{rate} kb/s' for rate in audio_bitrates) or 'none'}"
     )
     print("  A/V guard:   timestamp repair, duration padding/trim, per-track validation")
     print(
@@ -1469,7 +1608,7 @@ def print_summary(
     )
     print(f"  Cover:       {cover_description}")
     if info.duration:
-        total_bps = target_bps + selected_audio_count * audio_bitrate * 1000
+        total_bps = target_bps + sum(audio_bitrates) * 1000
         estimated_bytes = info.duration * total_bps / 8
         estimated_text = (
             f"{estimated_bytes / 1_000_000_000:.2f} GB"
@@ -1504,11 +1643,20 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="quality/size profile (default: high)",
     )
     parser.add_argument(
+        "--content-tune",
+        choices=CONTENT_TUNES,
+        default="movie",
+        help=(
+            "source-specific tuning: movie uses x264 film, anime uses animation, "
+            "and anime-grain preserves analog grain (default: movie)"
+        ),
+    )
+    parser.add_argument(
         "--max-fps",
         default="60",
         help="maximum output fps as a number or rational, never above 60 (default: 60)",
     )
-    parser.add_argument("--audio-bitrate", type=int, default=192, help="AAC bitrate in kb/s")
+    parser.add_argument("--audio-bitrate", type=int, default=192, help="AAC-LC output bitrate in kb/s")
     parser.add_argument(
         "--system-load",
         choices=tuple(SYSTEM_LOAD_THREADS),
@@ -1622,6 +1770,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         width, height = fitted_dimensions(info)
         fps = target_fps(info.fps, max_fps)
+        audio_bitrates = resolved_audio_bitrates(
+            ffprobe, source, info, selected_audio_tracks, args.audio_bitrate
+        )
         candidates = encoder_candidates(args.encoder, capabilities, args.vaapi_device)
         # HDR tone mapping is a CPU filter chain. Keeping decoded frames in
         # VideoToolbox only to download them for zscale adds pressure to shared
@@ -1671,6 +1822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             height,
                             fps,
                             args.quality,
+                            args.content_tune,
                             args.audio_bitrate,
                             args.tone_map,
                             args.vaapi_device,
@@ -1687,7 +1839,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             emit_progress("preflight", "done", plan.codec)
 
-        target_bps, maxrate_bps, _ = bitrate_plan(width, height, fps, args.quality)
+        target_bps, maxrate_bps, _ = bitrate_plan(
+            width, height, fps, args.quality, args.content_tune
+        )
         if custom_cover is not None:
             cover_description = f"embedded JPEG from {custom_cover.name}"
         elif cover_enabled and info.cover_stream_index is not None:
@@ -1702,9 +1856,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             height,
             fps,
             plan,
+            args.content_tune,
             target_bps,
             maxrate_bps,
-            args.audio_bitrate,
+            audio_bitrates,
             len(selected_audio_tracks),
             len(selected_subtitle_tracks),
             args.system_load,
@@ -1728,6 +1883,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             height,
             fps,
             args.quality,
+            args.content_tune,
             args.audio_bitrate,
             args.tone_map,
             args.vaapi_device,
@@ -1744,7 +1900,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ffmpeg,
                 source,
                 audio_temporary,
-                args.audio_bitrate,
+                audio_bitrates,
                 info.duration,
                 tuple(
                     info.audio_stream_indices[ordinal]
@@ -1903,6 +2059,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     height,
                     fps,
                     args.quality,
+                    args.content_tune,
                     args.audio_bitrate,
                     args.tone_map,
                     args.vaapi_device,
@@ -1922,6 +2079,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     height,
                     fps,
                     args.quality,
+                    args.content_tune,
                     args.audio_bitrate,
                     args.tone_map,
                     args.vaapi_device,
