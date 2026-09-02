@@ -140,18 +140,18 @@ and final validation.
 
 | Key | Action |
 | --- | --- |
-| `O` / `U` | Select input / edit output path |
-| `I` / `R` / `C` | Analyze / start / cancel conversion |
+| `I` / `O` / `U` | Select input / edit output path / refresh media analysis |
+| `T` / `A` | Start / abort conversion |
 | `P` | Pause or resume the complete transcoding process tree |
 | `Tab`, `Shift+Tab`, `1`–`5` | Change page |
 | Arrow keys, `Space` | Navigate and toggle a selected stream |
-| `A`, `S`, `X` | Select all audio, all subtitles, or clear a stream type |
+| `E`, `S`, `X` | Select all audio, all subtitles, or clear a stream type |
 | `N`, `D` | Save or delete a custom preset |
 | `Q` | Quit |
 
 Pause suspends the complete transcoder/FFmpeg process tree, so CPU/GPU work and
 output generation stop until `P` is pressed again. A paused conversion can be
-cancelled safely with `C`.
+aborted safely with `A`.
 
 ## Quality, HDR, and system load
 

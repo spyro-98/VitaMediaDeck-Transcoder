@@ -677,9 +677,9 @@ class TerminalApp:
         self.add(height - 4, 11, self.status.upper(), status_style, width - 13)
         self.signal_carrier(height - 2, 1, width - 3)
         footer = (
-            " O INPUT  U OUTPUT  I ANALYZE  R TRANSCODE  P PAUSE/RESUME  C ABORT  TAB VIEW  Q EXIT "
+            " I INPUT  O OUTPUT  U UPDATE  T TRANSCODE  P PAUSE/RESUME  A ABORT  TAB VIEW  Q EXIT "
             if width >= 108
-            else " O IN  U OUT  I SCAN  R RUN  P PAUSE  C STOP  TAB VIEW  Q EXIT "
+            else " I IN  O OUT  U UPDATE  T RUN  P PAUSE  A STOP  TAB VIEW  Q EXIT "
         )
         self.fill(height - 1, 0, width - 1, self.color(6))
         self.add(height - 1, 2, footer, self.color(6) | curses.A_BOLD, width - 4)
@@ -704,7 +704,7 @@ class TerminalApp:
         inner = width - 6
         if not self.info or not self.input_payload:
             self.centered(top + 3, left + 2, width - 4, "NO VIDEO SELECTED", self.color(5) | curses.A_BOLD)
-            self.centered(top + 5, left + 2, width - 4, "O SELECT VIDEO  ·  I ANALYZE", self.color(8))
+            self.centered(top + 5, left + 2, width - 4, "I SELECT VIDEO  ·  U UPDATE", self.color(8))
             if self.probe_error:
                 self.add(top + 7, left + 3, self.probe_error, self.color(5), inner)
             return
@@ -1109,7 +1109,7 @@ class TerminalApp:
         self.add(
             top,
             left,
-            "TRACK SELECTION   SPACE TOGGLE  ·  A ALL AUDIO  ·  S ALL SUBTITLES  ·  X CLEAR TYPE",
+            "TRACK SELECTION   SPACE TOGGLE  ·  E ALL AUDIO  ·  S ALL SUBTITLES  ·  X CLEAR TYPE",
             self.color(1) | curses.A_BOLD,
             width,
         )
@@ -1302,7 +1302,7 @@ class TerminalApp:
     def draw_log(self, top: int, left: int, height: int, width: int) -> None:
         lines = list(self.logs)
         if not lines:
-            lines = ["NO CONVERSION LOG YET  ·  PRESS R TO START"]
+            lines = ["NO CONVERSION LOG YET  ·  PRESS T TO START"]
         active = bool(self.process and self.process.poll() is None)
         animating = active and not self.paused
         self.add(top, left, "◢ CONVERSION LOG", self.color(13) | curses.A_BOLD, width)
@@ -1328,7 +1328,7 @@ class TerminalApp:
         elif self.live.phase == "complete":
             self.add(top + 3, left, "CONVERSION COMPLETE  ·  OUTPUT VERIFIED", self.color(3) | curses.A_BOLD, width)
         else:
-            self.add(top + 3, left, "READY  ·  PRESS R TO START", self.color(8), width)
+            self.add(top + 3, left, "READY  ·  PRESS T TO START", self.color(8), width)
 
         meter_width = max(8, width - 27)
         self.add(top + 4, left, "TOTAL", self.color(14) | curses.A_BOLD, 9)
@@ -1414,17 +1414,17 @@ class TerminalApp:
         if ord("1") <= key <= ord("5"):
             self.tab = key - ord("1")
             return
-        if key in (ord("o"), ord("O")):
+        if key in (ord("i"), ord("I")):
             self.choose_input()
-        elif key in (ord("u"), ord("U")):
+        elif key in (ord("o"), ord("O")):
             self.edit_output()
-        elif key in (ord("i"), ord("I")):
+        elif key in (ord("u"), ord("U")):
             self.probe_current()
-        elif key in (ord("r"), ord("R")):
+        elif key in (ord("t"), ord("T")):
             self.start_conversion()
         elif key in (ord("p"), ord("P")):
             self.toggle_pause()
-        elif key in (ord("c"), ord("C")):
+        elif key in (ord("a"), ord("A")):
             self.cancel_conversion()
         elif self.tab == 1:
             self.handle_streams_key(key)
@@ -1465,7 +1465,7 @@ class TerminalApp:
                 selected.add(ordinal)
                 action = "preserved"
             self.status = f"{kind.title()} track {ordinal} will be {action}."
-        elif key in (ord("a"), ord("A")):
+        elif key in (ord("e"), ord("E")):
             assert self.info is not None
             self.selected_audio_tracks = set(range(self.info.audio_stream_count))
             self.status = "Every audio track will be preserved."
@@ -1720,7 +1720,7 @@ class TerminalApp:
                 return
             if kind == "started":
                 self.status = (
-                    "Conversion paused. Press P to resume or C to cancel."
+                    "Conversion paused. Press P to resume or A to abort."
                     if self.paused
                     else f"Conversion running (PID {value})..."
                 )
@@ -1934,7 +1934,7 @@ class TerminalApp:
             self.paused = True
             self.live.eta_seconds = None
             self.logs.append("Conversion paused by user.")
-            self.status = "Conversion paused. Press P to resume or C to cancel."
+            self.status = "Conversion paused. Press P to resume or A to abort."
         except (OSError, RuntimeError) as exc:
             self.status = f"Could not pause conversion: {exc}"
         except Exception as exc:
