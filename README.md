@@ -112,6 +112,21 @@ must be outside the source folder; batch conversion runs one file at a time and
 continues with later episodes if one file fails. In the TUI, press `I`, browse
 to the series root, then press `D` to select that folder.
 
+Discovery is strictly bounded to that selected root: only supported media below
+it is converted, recursively. Sibling folders, parent-folder media, and files
+reached through symlinks that resolve outside the selected root are excluded.
+Open the **Batch** tab to inspect the complete numbered list of discovered,
+relative paths before starting.
+
+In **Batch**, use the arrow keys to navigate a media item and `Enter` to edit
+its own conversion settings. The **Settings** tab then identifies the active
+media; its values override the global defaults only for that item. Press `G`
+there to propagate the highlighted setting to every discovered compatible
+media, or press `R` in **Batch** to return one item to the global defaults.
+Pressing `G` in **Batch** clears all per-media overrides and restores the
+global defaults for the whole folder. Per-media settings are saved into the
+batch plan and resume file, so an interrupted folder conversion keeps them.
+
 During a batch, **TOTAL** reports progress across the complete folder while
 **EP** reports progress for the current episode. The current episode is shown
 as `EP 03/12`, including its source-relative path.
@@ -190,11 +205,17 @@ and final validation.
 | `I` / `O` / `U` | Select input video/folder / edit output path / refresh media analysis |
 | `T` / `A` | Start / abort conversion |
 | `P` | Pause or resume the complete transcoding process tree |
-| `Tab`, `Shift+Tab`, `1`–`5` | Change page |
+| `Tab`, `Shift+Tab`, `1`–`6` | Change page |
 | Arrow keys, `Space` | Navigate and toggle a selected stream |
 | `E`, `S`, `X` | Select all audio, all subtitles, or clear a stream type |
 | `N`, `D` | Save or delete a custom preset |
 | `Q` | Quit; during conversion, optionally save a resume file before aborting |
+
+The **Batch** page is available after selecting a directory: arrow keys browse
+the discovered relative paths, `Enter` opens per-media settings, `R` resets the
+selected media to global defaults, and `G` resets every media to global defaults.
+While editing an item on **Settings**, `G` propagates the highlighted setting
+to the other discovered compatible media.
 
 In the input browser, press `D` to select the current folder for recursive
 batch conversion. Batch mode retains all compatible audio and subtitle tracks

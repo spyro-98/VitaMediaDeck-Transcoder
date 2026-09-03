@@ -35,7 +35,7 @@ except ImportError as exc:  # pragma: no cover - exercised on Windows without wi
 import vitamediadeck_transcoder as core
 
 
-TABS = ("Overview", "Streams", "Settings", "Presets", "Log")
+TABS = ("Overview", "Streams", "Settings", "Presets", "Batch", "Log")
 KEY_BACK_TAB = getattr(curses, "KEY_BTAB", 353)
 VIDEO_EXTENSIONS = core.VIDEO_EXTENSIONS
 PHASE_RANGES: dict[str, tuple[float, float, str]] = {
@@ -99,6 +99,7 @@ class Settings:
         audio_tracks: Sequence[int] | None = None,
         subtitle_tracks: Sequence[int] | None = None,
         resume_state: Path | None = None,
+        batch_plan: Path | None = None,
     ) -> list[str]:
         command = [
             sys.executable,
@@ -151,6 +152,8 @@ class Settings:
             command.append("--overwrite")
         if resume_state is not None:
             command.extend(["--resume-state", str(resume_state)])
+        if batch_plan is not None:
+            command.extend(["--batch-plan", str(batch_plan)])
         return command
 
 
@@ -350,6 +353,12 @@ class TerminalApp:
         self.info: core.MediaInfo | None = None
         self.capabilities: core.Capabilities | None = None
         self.batch_sources: list[Path] = []
+        self.batch_settings: dict[Path, Settings] = {}
+        self.batch_selection_index = 0
+        self.batch_edit_source: Path | None = None
+        self.batch_plan_path: Path | None = None
+        if self.resume_state_path and self.input_path and self.input_path.is_dir():
+            self.restore_batch_settings(self.resume_state_path)
         self.probe_error = ""
         self.status = self.presets.error or "Choose an input video or folder with I."
         self.tab = 0
@@ -373,6 +382,34 @@ class TerminalApp:
         self.frame = 0
         self.running = True
         self._configure_screen()
+
+    def restore_batch_settings(self, state_path: Path) -> None:
+        """Restore per-file TUI options carried by an interrupted folder conversion."""
+        try:
+            state = core.load_resume_state(state_path)
+        except core.TranscodeError:
+            return
+        for item in state.get("entries") or []:
+            if not isinstance(item, dict) or not isinstance(item.get("settings"), dict):
+                continue
+            source = Path(str(item.get("source") or "")).expanduser().resolve()
+            self.batch_settings[source] = Settings.from_dict(item["settings"])
+
+    def active_settings(self) -> Settings:
+        if self.batch_edit_source is None:
+            return self.settings
+        if self.batch_edit_source not in self.batch_sources:
+            self.batch_edit_source = None
+            return self.settings
+        if self.batch_edit_source not in self.batch_settings:
+            self.batch_settings[self.batch_edit_source] = Settings.from_dict(asdict(self.settings))
+        return self.batch_settings[self.batch_edit_source]
+
+    def settings_for_batch_source(self, source: Path) -> Settings:
+        return self.batch_settings.get(source, self.settings)
+
+    def reset_batch_source_settings(self, source: Path) -> None:
+        self.batch_settings.pop(source, None)
 
     def _configure_screen(self) -> None:
         try:
@@ -663,7 +700,7 @@ class TerminalApp:
         self.add(2, 2, f"IN  › {source_name}", self.color(8), max(10, width // 2 - 4))
         self.add(2, width // 2, f"OUT › {target_name}", self.color(8), width // 2 - 3)
         cursor = 2
-        compact_names = ("HOME", "STREAMS", "SET", "PRESET", "LOG")
+        compact_names = ("HOME", "STREAMS", "SET", "PRESET", "BATCH", "LOG")
         for index, name in enumerate(TABS):
             nav_name = compact_names[index] if width < 110 else name.upper()
             label = f" {index + 1:02d}·{nav_name} "
@@ -682,6 +719,8 @@ class TerminalApp:
             self.draw_settings(content_top + 1, 3, content_height - 2, width - 6)
         elif self.tab == 3:
             self.draw_presets(content_top + 1, 3, content_height - 2, width - 6)
+        elif self.tab == 4:
+            self.draw_batch(content_top + 1, 3, content_height - 2, width - 6)
         else:
             self.draw_log(content_top + 1, 3, content_height - 2, width - 6)
         status_style = self.color(5) if any(token in self.status.lower() for token in ("fail", "error", "could not")) else self.color(4)
@@ -1293,9 +1332,22 @@ class TerminalApp:
         return rows
 
     def draw_settings(self, top: int, left: int, height: int, width: int) -> None:
+        settings = self.active_settings()
+        editing = (
+            f"MEDIA › {self.batch_edit_source.relative_to(self.input_path)}"
+            if self.batch_edit_source and self.input_path
+            else "GLOBAL DEFAULTS"
+        )
         self.add(top, left, "◢ CONVERSION SETTINGS", self.color(1) | curses.A_BOLD, width)
-        self.add(top + 1, left, "UP/DOWN SELECT  ·  LEFT/RIGHT MODIFY  ·  ENTER DIRECT INPUT", self.color(8), width)
-        list_height = max(1, height - 5)
+        self.add(top + 1, left, editing, self.color(4) | curses.A_BOLD, width)
+        self.add(
+            top + 2,
+            left,
+            "UP/DOWN SELECT  ·  LEFT/RIGHT MODIFY  ·  ENTER DIRECT INPUT  ·  G APPLY FIELD TO ALL",
+            self.color(8),
+            width,
+        )
+        list_height = max(1, height - 6)
         offset = min(
             max(0, self.setting_index - list_height + 1),
             max(0, len(self.SETTING_ROWS) - list_height),
@@ -1304,16 +1356,16 @@ class TerminalApp:
             index = offset + visible
             selected = index == self.setting_index
             style = self.color(2) | curses.A_BOLD if selected else 0
-            value = getattr(self.settings, attribute)
+            value = getattr(settings, attribute)
             if isinstance(value, bool):
                 value = "ENABLED" if value else "DISABLED"
-            if attribute == "cover_image" and self.settings.cover_mode != "custom":
+            if attribute == "cover_image" and settings.cover_mode != "custom":
                 value = "NOT USED"
                 style = self.color(8) if not selected else style
             marker = "◇" if selected else "·"
             value_text = f"‹ {value} ›" if choices is not None and selected else str(value)
             row = f"{marker} P{index + 1:02d}  {label.upper():<20}  {value_text}"
-            self.add(top + 3 + visible, left, row, style, width)
+            self.add(top + 4 + visible, left, row, style, width)
         _, attribute, _ = self.SETTING_ROWS[self.setting_index]
         if height >= 8:
             help_text = self.SETTING_HELP.get(attribute, "")
@@ -1342,6 +1394,46 @@ class TerminalApp:
                 left,
                 f"{selector} M{index + 1:02d}  {name.upper():<28}  "
                 f"‹{marker} · {tuning}›",
+                style,
+                width,
+            )
+
+    def draw_batch(self, top: int, left: int, height: int, width: int) -> None:
+        if not self.input_path or not self.input_path.is_dir():
+            self.add(top, left, "◢ BATCH MEDIA", self.color(1) | curses.A_BOLD, width)
+            self.add(top + 2, left, "SELECT A DIRECTORY WITH I, THEN PRESS D IN THE BROWSER.", self.color(8), width)
+            return
+        self.add(top, left, "◢ DISCOVERED MEDIA INSIDE SELECTED DIRECTORY", self.color(1) | curses.A_BOLD, width)
+        self.add(top + 1, left, f"ROOT › {self.input_path}", self.color(8), width)
+        self.add(
+            top + 2,
+            left,
+            "UP/DOWN NAVIGATE  ·  ENTER EDIT THIS MEDIA  ·  R RESET TO GLOBAL  ·  G RESET ALL TO GLOBAL",
+            self.color(8),
+            width,
+        )
+        if not self.batch_sources:
+            self.add(top + 4, left, "NO SUPPORTED VIDEO FOUND BELOW THIS DIRECTORY.", self.color(5), width)
+            return
+        self.batch_selection_index = min(self.batch_selection_index, len(self.batch_sources) - 1)
+        list_height = max(1, height - 4)
+        offset = min(
+            max(0, self.batch_selection_index - list_height + 1),
+            max(0, len(self.batch_sources) - list_height),
+        )
+        for row, source in enumerate(self.batch_sources[offset : offset + list_height]):
+            index = offset + row
+            selected = index == self.batch_selection_index
+            style = self.color(2) | curses.A_BOLD if selected else 0
+            setting = self.settings_for_batch_source(source)
+            origin = "CUSTOM" if source in self.batch_settings else "GLOBAL"
+            relative = source.relative_to(self.input_path)
+            summary = f"{setting.encoder}/{setting.quality}/{setting.max_fps}fps"
+            marker = "◇" if selected else "·"
+            self.add(
+                top + 4 + row,
+                left,
+                f"{marker} {index + 1:03d}  {origin:<6}  {summary:<26}  {relative}",
                 style,
                 width,
             )
@@ -1482,7 +1574,7 @@ class TerminalApp:
         if key == KEY_BACK_TAB:
             self.tab = (self.tab - 1) % len(TABS)
             return
-        if ord("1") <= key <= ord("5"):
+        if ord("1") <= key <= ord(str(len(TABS))):
             self.tab = key - ord("1")
             return
         if key in (ord("i"), ord("I")):
@@ -1503,6 +1595,8 @@ class TerminalApp:
             self.handle_settings_key(key)
         elif self.tab == 3:
             self.handle_presets_key(key)
+        elif self.tab == 4:
+            self.handle_batch_key(key)
         else:
             self.handle_scroll_key(key)
 
@@ -1584,24 +1678,35 @@ class TerminalApp:
             self.setting_index = (self.setting_index + 1) % len(self.SETTING_ROWS)
             return
         _, attribute, choices = self.SETTING_ROWS[self.setting_index]
+        settings = self.active_settings()
+        if key in (ord("g"), ord("G")):
+            if not self.input_path or not self.input_path.is_dir() or self.batch_edit_source is None:
+                self.status = "Select a media item from Batch before propagating a setting."
+                return
+            value = getattr(settings, attribute)
+            for source in self.batch_sources:
+                target = self.batch_settings.setdefault(source, Settings.from_dict(asdict(self.settings)))
+                setattr(target, attribute, value)
+            self.status = f"Applied {attribute} to {len(self.batch_sources)} compatible batch media item(s)."
+            return
         if choices is not None and key in (curses.KEY_LEFT, curses.KEY_RIGHT, 10, 13, ord(" ")):
             values = list(choices)
-            current = getattr(self.settings, attribute)
+            current = getattr(settings, attribute)
             try:
                 index = values.index(current)
             except ValueError:
                 index = 0
             direction = -1 if key == curses.KEY_LEFT else 1
-            setattr(self.settings, attribute, values[(index + direction) % len(values)])
+            setattr(settings, attribute, values[(index + direction) % len(values)])
             self.status = f"Changed {attribute}. Inspect again to refresh the output estimate."
         elif choices is None and key in (10, 13):
-            if attribute == "cover_image" and self.settings.cover_mode != "custom":
+            if attribute == "cover_image" and settings.cover_mode != "custom":
                 self.status = "Set Cover to custom first."
                 return
-            current = str(getattr(self.settings, attribute))
+            current = str(getattr(settings, attribute))
             value = self.prompt(f"{attribute}", current)
             if value is not None:
-                setattr(self.settings, attribute, value)
+                setattr(settings, attribute, value)
 
     def handle_presets_key(self, key: int) -> None:
         rows = self.presets.rows()
@@ -1611,13 +1716,17 @@ class TerminalApp:
             self.preset_index = (self.preset_index + 1) % len(rows)
         elif key in (10, 13) and rows:
             name, _, settings = rows[self.preset_index]
-            self.settings = Settings.from_dict(asdict(settings))
+            selected = Settings.from_dict(asdict(settings))
+            if self.batch_edit_source is None:
+                self.settings = selected
+            else:
+                self.batch_settings[self.batch_edit_source] = selected
             self.status = f"Loaded preset: {name}"
         elif key in (ord("n"), ord("N")):
             name = self.prompt("New preset name", "")
             if name is not None:
                 try:
-                    self.presets.save(name, self.settings)
+                    self.presets.save(name, self.active_settings())
                     self.status = f"Saved preset: {name.strip()}"
                 except (OSError, ValueError) as exc:
                     self.status = str(exc)
@@ -1633,6 +1742,37 @@ class TerminalApp:
                 except OSError as exc:
                     self.status = f"Could not delete preset: {exc}"
 
+    def handle_batch_key(self, key: int) -> None:
+        if not self.batch_sources:
+            self.status = "No batch media is available. Select a directory and inspect it first."
+            return
+        if key == curses.KEY_UP:
+            self.batch_selection_index = (self.batch_selection_index - 1) % len(self.batch_sources)
+            return
+        if key == curses.KEY_DOWN:
+            self.batch_selection_index = (self.batch_selection_index + 1) % len(self.batch_sources)
+            return
+        if key in (curses.KEY_PPAGE, curses.KEY_HOME):
+            self.batch_selection_index = 0
+            return
+        if key in (curses.KEY_NPAGE, curses.KEY_END):
+            self.batch_selection_index = len(self.batch_sources) - 1
+            return
+        source = self.batch_sources[self.batch_selection_index]
+        if key in (10, 13):
+            self.batch_edit_source = source
+            self.tab = 2
+            self.status = f"Editing settings for {source.relative_to(self.input_path)}. Press G to propagate a field."
+        elif key in (ord("r"), ord("R")):
+            self.reset_batch_source_settings(source)
+            if self.batch_edit_source == source:
+                self.batch_edit_source = None
+            self.status = f"{source.relative_to(self.input_path)} now inherits global settings."
+        elif key in (ord("g"), ord("G")):
+            self.batch_settings.clear()
+            self.batch_edit_source = None
+            self.status = f"All {len(self.batch_sources)} media item(s) now inherit global settings."
+
     def choose_input(self) -> None:
         start = self.input_path.parent if self.input_path else Path.cwd()
         chosen = self.file_browser(start)
@@ -1640,6 +1780,10 @@ class TerminalApp:
             return
         self.input_path = chosen.resolve()
         self.resume_state_path = None
+        self.batch_settings.clear()
+        self.batch_edit_source = None
+        self.batch_selection_index = 0
+        self.batch_plan_path = None
         self.output_path = (
             core.default_batch_output(self.input_path)
             if self.input_path.is_dir()
@@ -1651,18 +1795,9 @@ class TerminalApp:
         self.batch_sources = []
         self.probe_current()
 
-    def planned_resume_entries(self) -> list[dict[str, str]]:
+    def planned_resume_entries(self) -> list[dict[str, Any]]:
         if not self.input_path or not self.output_path:
             raise ValueError("Select an input and output before saving a resume file.")
-        if self.resume_state_path:
-            state = core.load_resume_state(self.resume_state_path)
-            if (
-                Path(str(state.get("input_path") or "")).expanduser().resolve() == self.input_path
-                and Path(str(state.get("output_path") or "")).expanduser().resolve() == self.output_path
-            ):
-                entries = state.get("entries")
-                if isinstance(entries, list):
-                    return entries
         if self.input_path.is_dir():
             sources = self.batch_sources or core.batch_video_sources(self.input_path)
             if not sources:
@@ -1671,6 +1806,7 @@ class TerminalApp:
                 {
                     "source": str(source),
                     "output": str(core.batch_output_path(self.input_path, self.output_path, source)),
+                    "settings": asdict(self.settings_for_batch_source(source)),
                 }
                 for source in sources
             ]
@@ -1706,6 +1842,29 @@ class TerminalApp:
         self.resume_saved_path = self.resume_state_path
         return self.resume_state_path
 
+    def save_batch_plan(self) -> Path:
+        if not self.input_path or not self.input_path.is_dir() or not self.output_path:
+            raise ValueError("Select a directory and output folder before saving a batch plan.")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        plan_path = config_directory() / "batch-plans" / f"vitamediadeck-{stamp}.batch.json"
+        payload = {
+            "version": core.RESUME_STATE_VERSION,
+            "mode": "batch",
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "entries": self.planned_resume_entries(),
+        }
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = plan_path.with_suffix(plan_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, plan_path)
+        try:
+            plan_path.chmod(0o600)
+        except OSError:
+            pass
+        self.batch_plan_path = plan_path.resolve()
+        return self.batch_plan_path
+
     def edit_output(self) -> None:
         current = str(self.output_path or "")
         is_batch = bool(self.input_path and self.input_path.is_dir())
@@ -1730,6 +1889,17 @@ class TerminalApp:
             self.selected_audio_tracks.clear()
             self.selected_subtitle_tracks.clear()
             self.batch_sources = core.batch_video_sources(self.input_path)
+            self.batch_settings = {
+                source: settings
+                for source, settings in self.batch_settings.items()
+                if source in self.batch_sources
+            }
+            if self.batch_edit_source not in self.batch_sources:
+                self.batch_edit_source = None
+            self.batch_selection_index = min(
+                self.batch_selection_index,
+                max(0, len(self.batch_sources) - 1),
+            )
             if not self.batch_sources:
                 self.probe_error = "No supported video files found recursively."
                 self.status = "No videos found in the selected folder."
@@ -1812,8 +1982,20 @@ class TerminalApp:
         if is_batch and (self.output_path == self.input_path or self.input_path in self.output_path.parents):
             self.status = "Choose an output folder outside the input folder."
             return
-        if self.settings.cover_mode == "custom" and not Path(self.settings.cover_image).expanduser().is_file():
+        settings_to_check = [self.settings]
+        if is_batch:
+            settings_to_check.extend(self.batch_settings.values())
+        if any(
+            setting.cover_mode == "custom"
+            and not Path(setting.cover_image).expanduser().is_file()
+            for setting in settings_to_check
+        ):
             self.status = "Select a valid custom cover image in Settings."
+            return
+        try:
+            batch_plan = self.save_batch_plan() if is_batch and not self.resume_state_path else None
+        except (OSError, ValueError) as exc:
+            self.status = f"Could not save per-media batch settings: {exc}"
             return
         command = (
             self.settings.command(
@@ -1821,6 +2003,7 @@ class TerminalApp:
                 self.input_path,
                 self.output_path,
                 resume_state=self.resume_state_path,
+                batch_plan=batch_plan,
             )
             if is_batch
             else self.settings.command(

@@ -1718,17 +1718,71 @@ def resume_entries(
 
 
 def batch_video_sources(source: Path) -> list[Path]:
-    """Return known video files below a folder in stable playback order."""
+    """Return video files physically inside the selected folder, recursively."""
+    source = source.resolve()
     return sorted(
         (
             candidate
             for candidate in source.rglob("*")
             if candidate.is_file()
+            and source in candidate.resolve().parents
             and not candidate.name.startswith("._")
             and candidate.suffix.lower() in VIDEO_EXTENSIONS
         ),
         key=lambda candidate: str(candidate.relative_to(source)).casefold(),
     )
+
+
+def saved_batch_entries(
+    state_path: Path,
+    source: Path,
+    output: Path,
+) -> list[tuple[Path, Path, dict[str, Any]]]:
+    """Load a saved batch or a fresh per-media batch plan with validated paths."""
+    state = load_resume_state(state_path)
+    entries = resume_entries(state_path, "batch", source, output)
+    return [
+        (
+            item_source,
+            item_output,
+            item.get("settings") if isinstance(item.get("settings"), dict) else {},
+        )
+        for (item_source, item_output), item in zip(entries, state["entries"])
+    ]
+
+
+def with_batch_settings(args: argparse.Namespace, settings: dict[str, Any]) -> argparse.Namespace:
+    """Apply a TUI per-media settings snapshot to one child conversion only."""
+    child = argparse.Namespace(**vars(args))
+    for attribute in (
+        "encoder",
+        "quality",
+        "content_tune",
+        "max_fps",
+        "audio_bitrate",
+        "system_load",
+        "tone_map",
+        "force_hdr",
+        "vaapi_device",
+        "ffmpeg",
+        "ffprobe",
+        "overwrite",
+    ):
+        if attribute in settings:
+            setattr(child, attribute, settings[attribute])
+    if "hw_decode" in settings:
+        child.no_hw_decode = not bool(settings["hw_decode"])
+    cover_mode = settings.get("cover_mode")
+    if cover_mode == "none":
+        child.no_cover = True
+        child.cover_image = None
+    elif cover_mode == "custom":
+        child.no_cover = False
+        child.cover_image = Path(str(settings.get("cover_image") or "")).expanduser()
+    elif cover_mode == "auto":
+        child.no_cover = False
+        child.cover_image = None
+    return child
 
 
 def batch_child_command(args: argparse.Namespace, source: Path, output: Path) -> list[str]:
@@ -1793,17 +1847,19 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
         raise TranscodeError(
             "The batch output directory must be outside the input directory."
         )
+    state_path = args.resume_state or args.batch_plan
     saved_entries = (
-        resume_entries(args.resume_state, "batch", source, output_root)
-        if args.resume_state
-        else None
+        saved_batch_entries(state_path, source, output_root) if state_path else None
     )
-    sources = [item_source for item_source, _ in saved_entries] if saved_entries else batch_video_sources(source)
+    sources = [item_source for item_source, _, _ in saved_entries] if saved_entries else batch_video_sources(source)
     if not sources:
         raise TranscodeError("No supported video files were found in the selected folder or its subfolders.")
     targets: dict[Path, Path] = {}
+    settings_by_source: dict[Path, dict[str, Any]] = {}
     seen_targets: dict[str, Path] = {}
-    for video, saved_target in saved_entries or [(item, None) for item in sources]:
+    for video, saved_target, saved_settings in saved_entries or [
+        (item, None, {}) for item in sources
+    ]:
         relative = video.relative_to(source)
         target = saved_target or batch_output_path(source, output_root, video)
         target_key = str(target).casefold()
@@ -1815,6 +1871,7 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
             )
         seen_targets[target_key] = video
         targets[video] = target
+        settings_by_source[video] = saved_settings
 
     print(f"Batch input: {source}", flush=True)
     print(f"Batch output: {output_root}", flush=True)
@@ -1822,16 +1879,20 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
     if args.resume_state:
         print(f"Resume state: {args.resume_state.expanduser().resolve()}", flush=True)
         _, resume_ffprobe, _ = resolve_media_tools(args.ffmpeg, args.ffprobe)
+    elif args.batch_plan:
+        print(f"Per-media settings plan: {args.batch_plan.expanduser().resolve()}", flush=True)
+        resume_ffprobe = ""
     else:
         resume_ffprobe = ""
     failures: list[Path] = []
     for index, video in enumerate(sources, start=1):
         relative = video.relative_to(source)
         target = targets[video]
+        child_args = with_batch_settings(args, settings_by_source[video])
         print(f"\n[BATCH {index}/{len(sources)}] {relative}", flush=True)
         if args.resume_state:
             cleanup_partial_output(target)
-            if resume_output_is_valid(resume_ffprobe, video, target, args):
+            if resume_output_is_valid(resume_ffprobe, video, target, child_args):
                 print(f"[BATCH {index}/{len(sources)}] SKIPPED: completed output is valid", flush=True)
                 emit_progress(
                     "complete",
@@ -1849,7 +1910,7 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
             "VMD_BATCH_SOURCE": str(relative),
         }
         result = subprocess.run(
-            batch_child_command(args, video, target),
+            batch_child_command(child_args, video, target),
             check=False,
             env=child_env,
         )
@@ -2052,10 +2113,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="do not generate and embed cover.jpg (enabled by default)",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
-    parser.add_argument(
+    batch_state_group = parser.add_mutually_exclusive_group()
+    batch_state_group.add_argument(
         "--resume-state",
         type=Path,
         help="resume a saved conversion with the exact input/output paths and file list",
+    )
+    batch_state_group.add_argument(
+        "--batch-plan",
+        type=Path,
+        help="apply saved per-media settings to a recursive folder conversion",
     )
     parser.add_argument("--dry-run", action="store_true", help="inspect and print the command only")
     return parser.parse_args(argv)
@@ -2069,6 +2136,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return convert_directory(args, source)
         if not source.is_file():
             raise TranscodeError(f"Input file not found: {source}")
+        if args.batch_plan:
+            raise TranscodeError("--batch-plan can only be used when the input is a directory.")
         ffmpeg, ffprobe, tool_origin = resolve_media_tools(args.ffmpeg, args.ffprobe)
         print(f"FFmpeg toolchain: {tool_origin} ({ffmpeg})")
         output = (args.output or default_output(source)).expanduser().resolve()
