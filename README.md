@@ -94,6 +94,53 @@ python3 vitamediadeck_transcoder.py input.mkv --encoder x264
 python3 vitamediadeck_transcoder.py anime.mkv --encoder x264 --content-tune anime
 ```
 
+### Convert a series folder
+
+Pass a folder instead of one video to convert every supported video file inside
+it, including all subfolders. The output is a separate sibling folder by
+default, and it mirrors the input layout so seasons and episode folders remain
+organized. Each output file receives the `.vitamediadeck.mkv` suffix.
+
+```sh
+python3 vitamediadeck_transcoder.py "My Series"
+python3 vitamediadeck_transcoder.py "My Series" "Vita-ready Series"
+```
+
+For example, `My Series/Season 01/Episode 01.mkv` becomes
+`Vita-ready Series/Season 01/Episode 01.vitamediadeck.mkv`. The destination
+must be outside the source folder; batch conversion runs one file at a time and
+continues with later episodes if one file fails. In the TUI, press `I`, browse
+to the series root, then press `D` to select that folder.
+
+During a batch, **TOTAL** reports progress across the complete folder while
+**EP** reports progress for the current episode. The current episode is shown
+as `EP 03/12`, including its source-relative path.
+
+### Save and resume an interrupted conversion
+
+When a conversion is active, press `Q`. The interface asks whether to save a
+resume file before it aborts and exits. The file freezes the original input and
+output paths, the selected settings, and the exact list of input/output files;
+the terminal prints its path after the interface closes. Resume it with:
+
+```sh
+python3 vitamediadeck_tui.py --resume-state "/path/to/vitamediadeck-YYYYMMDD-HHMMSS.resume.json"
+```
+
+For scripted use, pass the same state to the CLI with the original source and
+destination paths:
+
+```sh
+python3 vitamediadeck_transcoder.py "My Series" "Vita-ready Series" --resume-state "/path/to/resume.json"
+```
+
+For a series folder, completed files are independently revalidated and skipped.
+Temporary partial files created by the converter are removed automatically, and
+only their incomplete episode is encoded again. FFmpeg cannot safely continue
+from the middle of an incomplete Matroska encode, so that one episode restarts
+from its beginning; completed episodes remain untouched. A resume file rejects
+changed input/output paths, missing source files, or a changed saved file list.
+
 Launch the terminal interface:
 
 ```sh
@@ -140,14 +187,18 @@ and final validation.
 
 | Key | Action |
 | --- | --- |
-| `I` / `O` / `U` | Select input / edit output path / refresh media analysis |
+| `I` / `O` / `U` | Select input video/folder / edit output path / refresh media analysis |
 | `T` / `A` | Start / abort conversion |
 | `P` | Pause or resume the complete transcoding process tree |
 | `Tab`, `Shift+Tab`, `1`–`5` | Change page |
 | Arrow keys, `Space` | Navigate and toggle a selected stream |
 | `E`, `S`, `X` | Select all audio, all subtitles, or clear a stream type |
 | `N`, `D` | Save or delete a custom preset |
-| `Q` | Quit |
+| `Q` | Quit; during conversion, optionally save a resume file before aborting |
+
+In the input browser, press `D` to select the current folder for recursive
+batch conversion. Batch mode retains all compatible audio and subtitle tracks
+for each video because episode stream layouts can differ.
 
 Pause suspends the complete transcoder/FFmpeg process tree, so CPU/GPU work and
 output generation stop until `P` is pressed again. A paused conversion can be

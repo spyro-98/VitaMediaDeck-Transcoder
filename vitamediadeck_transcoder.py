@@ -40,6 +40,13 @@ COVER_BLACK_YAVG_MAX = 10.0
 COVER_BLACK_YMAX_MAX = 32.0
 MAX_FPS = Fraction(60, 1)
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67", "hlg", "pq"}
+VIDEO_EXTENSIONS = frozenset(
+    {
+        ".3gp", ".asf", ".avi", ".divx", ".flv", ".m2ts", ".m4v", ".mkv",
+        ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".ogm", ".ogv", ".rm",
+        ".rmvb", ".ts", ".vob", ".webm", ".wmv",
+    }
+)
 ENCODER_NAMES = {
     "videotoolbox": "h264_videotoolbox",
     "nvenc": "h264_nvenc",
@@ -60,6 +67,7 @@ X264_CONTENT_TUNES = {
     "anime-grain": "grain",
 }
 PROGRESS_PREFIX = "@@VMD_PROGRESS@@"
+RESUME_STATE_VERSION = 1
 PREFLIGHT_SECONDS = 3.0
 VIDEO_STALL_SECONDS = 30.0
 SYSTEM_LOAD_THREADS = {
@@ -89,15 +97,35 @@ class VideoProgressError(VideoPipelineError):
     pass
 
 
-def emit_progress(phase: str, state: str, detail: str = "") -> None:
+def emit_progress(
+    phase: str,
+    state: str,
+    detail: str = "",
+    **values: object,
+) -> None:
     if os.environ.get("VMD_MACHINE_PROGRESS") != "1":
         return
+    payload: dict[str, object] = {"phase": phase, "state": state, "detail": detail}
+    batch_index = os.environ.get("VMD_BATCH_INDEX")
+    batch_total = os.environ.get("VMD_BATCH_TOTAL")
+    if batch_index and batch_total:
+        try:
+            index = int(batch_index)
+            total = int(batch_total)
+        except ValueError:
+            index = total = 0
+        if 1 <= index <= total:
+            payload.update(
+                {
+                    "batch_index": index,
+                    "batch_total": total,
+                    "batch_source": os.environ.get("VMD_BATCH_SOURCE", ""),
+                }
+            )
+    payload.update(values)
     print(
         PROGRESS_PREFIX
-        + json.dumps(
-            {"phase": phase, "state": state, "detail": detail},
-            separators=(",", ":"),
-        ),
+        + json.dumps(payload, separators=(",", ":")),
         flush=True,
     )
 
@@ -198,6 +226,7 @@ def run_transcode_guarded(
     command: Sequence[str],
     system_load: str,
     expected_fps: Fraction,
+    expected_duration: float | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     """Stream FFmpeg output and abort only after sustained frame-counter stagnation."""
     process = subprocess.Popen(
@@ -225,6 +254,7 @@ def run_transcode_guarded(
     buffer = ""
     last_frame_count = -1
     last_frame_change = time.monotonic()
+    last_progress_ratio = -1.0
     starvation: tuple[int, float, float] | None = None
     while True:
         try:
@@ -244,6 +274,18 @@ def run_transcode_guarded(
         for line in parts:
             frame_match = re.search(r"(?:^|\s)frame=\s*(\d+)", line)
             media_seconds = progress_time_seconds(line)
+            if media_seconds is not None and expected_duration and expected_duration > 0:
+                progress_ratio = max(0.0, min(1.0, media_seconds / expected_duration))
+                if progress_ratio >= last_progress_ratio + 0.005 or progress_ratio >= 1.0:
+                    emit_progress(
+                        "transcode",
+                        "progress",
+                        "VIDEO PASS",
+                        progress=progress_ratio,
+                        media_seconds=media_seconds,
+                        duration=expected_duration,
+                    )
+                    last_progress_ratio = progress_ratio
             if not frame_match or media_seconds is None or media_seconds < 30.0:
                 continue
             frame_count = int(frame_match.group(1))
@@ -1555,6 +1597,285 @@ def default_output(source: Path) -> Path:
     return source.with_name(f"{source.stem}.vitamediadeck.mkv")
 
 
+def default_batch_output(source: Path) -> Path:
+    """Keep batch output separate from its source directory by default."""
+    return source.with_name(f"{source.name}.vitamediadeck")
+
+
+def batch_output_path(source_root: Path, output_root: Path, source: Path) -> Path:
+    relative = source.relative_to(source_root)
+    return (output_root / relative).with_name(f"{relative.stem}.vitamediadeck.mkv")
+
+
+def partial_output_paths(output: Path) -> tuple[Path, ...]:
+    """List only transient files that this transcoder itself creates."""
+    return (
+        output.with_name(f".{output.stem}.partial{output.suffix}"),
+        output.with_name(f".{output.stem}.audio-repair.mka"),
+        output.with_name(f".{output.stem}.repaired.partial{output.suffix}"),
+        output.with_name(f".{output.stem}.cover.jpg"),
+        output.with_name(f".{output.stem}.covered.partial{output.suffix}"),
+    )
+
+
+def cleanup_partial_output(output: Path) -> None:
+    for temporary in partial_output_paths(output):
+        if temporary.is_file():
+            temporary.unlink()
+
+
+def resume_output_is_valid(
+    ffprobe: str,
+    source: Path,
+    output: Path,
+    args: argparse.Namespace,
+) -> bool:
+    """Skip a batch member only when its completed output still meets the contract."""
+    if not output.is_file():
+        return False
+    try:
+        info = probe_media(ffprobe, source, args.force_hdr)
+        max_fps = fraction_from_text(args.max_fps)
+        if max_fps is None:
+            return False
+        selected_audio_tracks = selected_track_ordinals(
+            args.audio_track,
+            args.no_audio,
+            info.audio_stream_count,
+            "audio",
+        )
+        selected_subtitle_tracks = selected_track_ordinals(
+            args.subtitle_track,
+            args.no_subtitles,
+            len(info.subtitle_codecs),
+            "subtitle",
+        )
+        validate_output(
+            ffprobe,
+            output,
+            len(selected_audio_tracks),
+            len(selected_subtitle_tracks),
+            target_fps(info.fps, max_fps),
+            not args.no_cover,
+            info.duration,
+            expected_attachment_count=info.attachment_count,
+        )
+    except (TranscodeError, OSError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def load_resume_state(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TranscodeError(f"Could not read resume state: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("version") != RESUME_STATE_VERSION:
+        raise TranscodeError("The resume state is missing or uses an unsupported version.")
+    if payload.get("mode") not in {"file", "batch"}:
+        raise TranscodeError("The resume state has an invalid conversion mode.")
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise TranscodeError("The resume state does not contain any input/output entries.")
+    return payload
+
+
+def resume_entries(
+    state_path: Path,
+    mode: str,
+    source: Path,
+    output: Path,
+) -> list[tuple[Path, Path]]:
+    state = load_resume_state(state_path)
+    expected_source = Path(str(state.get("input_path") or "")).expanduser().resolve()
+    expected_output = Path(str(state.get("output_path") or "")).expanduser().resolve()
+    if state.get("mode") != mode or source != expected_source or output != expected_output:
+        raise TranscodeError(
+            "The resume state does not match the selected input and output paths."
+        )
+    entries: list[tuple[Path, Path]] = []
+    for item in state["entries"]:
+        if not isinstance(item, dict):
+            raise TranscodeError("The resume state contains an invalid entry.")
+        item_source = Path(str(item.get("source") or "")).expanduser().resolve()
+        item_output = Path(str(item.get("output") or "")).expanduser().resolve()
+        if not item_source.is_file():
+            raise TranscodeError(f"A saved input file no longer exists: {item_source}")
+        if mode == "batch" and source not in item_source.parents:
+            raise TranscodeError(f"Saved input is outside the original folder: {item_source}")
+        if mode == "batch" and output not in item_output.parents:
+            raise TranscodeError(f"Saved output is outside the original destination: {item_output}")
+        entries.append((item_source, item_output))
+    if mode == "file" and entries != [(source, output)]:
+        raise TranscodeError("The resume state does not match the selected input/output file.")
+    if mode == "batch" and [item_source for item_source, _ in entries] != batch_video_sources(
+        source
+    ):
+        raise TranscodeError(
+            "The files in the source folder changed after the resume state was saved."
+        )
+    return entries
+
+
+def batch_video_sources(source: Path) -> list[Path]:
+    """Return known video files below a folder in stable playback order."""
+    return sorted(
+        (
+            candidate
+            for candidate in source.rglob("*")
+            if candidate.is_file()
+            and not candidate.name.startswith("._")
+            and candidate.suffix.lower() in VIDEO_EXTENSIONS
+        ),
+        key=lambda candidate: str(candidate.relative_to(source)).casefold(),
+    )
+
+
+def batch_child_command(args: argparse.Namespace, source: Path, output: Path) -> list[str]:
+    """Re-run the verified single-file flow for one member of a batch."""
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        str(source),
+        str(output),
+        "--encoder",
+        args.encoder,
+        "--quality",
+        args.quality,
+        "--content-tune",
+        args.content_tune,
+        "--max-fps",
+        args.max_fps,
+        "--audio-bitrate",
+        str(args.audio_bitrate),
+        "--system-load",
+        args.system_load,
+        "--tone-map",
+        args.tone_map,
+        "--vaapi-device",
+        str(args.vaapi_device),
+        "--ffmpeg",
+        args.ffmpeg,
+        "--ffprobe",
+        args.ffprobe,
+    ]
+    if args.force_hdr:
+        command.append("--force-hdr")
+    if args.no_hw_decode:
+        command.append("--no-hw-decode")
+    if args.audio_track:
+        for ordinal in args.audio_track:
+            command.extend(["--audio-track", str(ordinal)])
+    elif args.no_audio:
+        command.append("--no-audio")
+    if args.subtitle_track:
+        for ordinal in args.subtitle_track:
+            command.extend(["--subtitle-track", str(ordinal)])
+    elif args.no_subtitles:
+        command.append("--no-subtitles")
+    if args.cover_image:
+        command.extend(["--cover-image", str(args.cover_image)])
+    elif args.no_cover:
+        command.append("--no-cover")
+    if args.overwrite:
+        command.append("--overwrite")
+    if args.dry_run:
+        command.append("--dry-run")
+    return command
+
+
+def convert_directory(args: argparse.Namespace, source: Path) -> int:
+    """Convert every supported video below source while preserving subfolders."""
+    output_root = (args.output or default_batch_output(source)).expanduser().resolve()
+    if output_root.suffix.lower() == ".mkv":
+        raise TranscodeError("A folder input needs an output directory, not an .mkv file.")
+    if output_root == source or source in output_root.parents:
+        raise TranscodeError(
+            "The batch output directory must be outside the input directory."
+        )
+    saved_entries = (
+        resume_entries(args.resume_state, "batch", source, output_root)
+        if args.resume_state
+        else None
+    )
+    sources = [item_source for item_source, _ in saved_entries] if saved_entries else batch_video_sources(source)
+    if not sources:
+        raise TranscodeError("No supported video files were found in the selected folder or its subfolders.")
+    targets: dict[Path, Path] = {}
+    seen_targets: dict[str, Path] = {}
+    for video, saved_target in saved_entries or [(item, None) for item in sources]:
+        relative = video.relative_to(source)
+        target = saved_target or batch_output_path(source, output_root, video)
+        target_key = str(target).casefold()
+        previous = seen_targets.get(target_key)
+        if previous is not None:
+            raise TranscodeError(
+                "Two source files would create the same batch output: "
+                f"{previous.relative_to(source)} and {relative}."
+            )
+        seen_targets[target_key] = video
+        targets[video] = target
+
+    print(f"Batch input: {source}", flush=True)
+    print(f"Batch output: {output_root}", flush=True)
+    print(f"Videos found: {len(sources)}", flush=True)
+    if args.resume_state:
+        print(f"Resume state: {args.resume_state.expanduser().resolve()}", flush=True)
+        _, resume_ffprobe, _ = resolve_media_tools(args.ffmpeg, args.ffprobe)
+    else:
+        resume_ffprobe = ""
+    failures: list[Path] = []
+    for index, video in enumerate(sources, start=1):
+        relative = video.relative_to(source)
+        target = targets[video]
+        print(f"\n[BATCH {index}/{len(sources)}] {relative}", flush=True)
+        if args.resume_state:
+            cleanup_partial_output(target)
+            if resume_output_is_valid(resume_ffprobe, video, target, args):
+                print(f"[BATCH {index}/{len(sources)}] SKIPPED: completed output is valid", flush=True)
+                emit_progress(
+                    "complete",
+                    "done",
+                    "resumed existing output",
+                    batch_index=index,
+                    batch_total=len(sources),
+                    batch_source=str(relative),
+                )
+                continue
+        child_env = {
+            **os.environ,
+            "VMD_BATCH_INDEX": str(index),
+            "VMD_BATCH_TOTAL": str(len(sources)),
+            "VMD_BATCH_SOURCE": str(relative),
+        }
+        result = subprocess.run(
+            batch_child_command(args, video, target),
+            check=False,
+            env=child_env,
+        )
+        if result.returncode != 0:
+            failures.append(relative)
+            print(
+                f"[BATCH {index}/{len(sources)}] FAILED: {relative}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if failures:
+        print(
+            f"Batch completed with {len(failures)} failure(s): "
+            + ", ".join(str(item) for item in failures),
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+    print(
+        f"\nBatch complete: {len(sources)} file(s) converted to {output_root}",
+        flush=True,
+    )
+    return 0
+
+
 def print_summary(
     info: MediaInfo,
     width: int,
@@ -1628,8 +1949,17 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "Hardware encoding is preferred automatically."
         )
     )
-    parser.add_argument("input", type=Path, help="input video accepted by the installed FFmpeg")
-    parser.add_argument("output", type=Path, nargs="?", help="output Matroska (.mkv) path")
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="input video, or a folder to convert recursively",
+    )
+    parser.add_argument(
+        "output",
+        type=Path,
+        nargs="?",
+        help="output .mkv for one video, or output directory for a folder",
+    )
     parser.add_argument(
         "--encoder",
         choices=["auto", *ENCODER_NAMES],
@@ -1722,6 +2052,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         help="do not generate and embed cover.jpg (enabled by default)",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace an existing output file")
+    parser.add_argument(
+        "--resume-state",
+        type=Path,
+        help="resume a saved conversion with the exact input/output paths and file list",
+    )
     parser.add_argument("--dry-run", action="store_true", help="inspect and print the command only")
     return parser.parse_args(argv)
 
@@ -1729,11 +2064,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     try:
-        ffmpeg, ffprobe, tool_origin = resolve_media_tools(args.ffmpeg, args.ffprobe)
-        print(f"FFmpeg toolchain: {tool_origin} ({ffmpeg})")
         source = args.input.expanduser().resolve()
+        if source.is_dir():
+            return convert_directory(args, source)
         if not source.is_file():
             raise TranscodeError(f"Input file not found: {source}")
+        ffmpeg, ffprobe, tool_origin = resolve_media_tools(args.ffmpeg, args.ffprobe)
+        print(f"FFmpeg toolchain: {tool_origin} ({ffmpeg})")
         output = (args.output or default_output(source)).expanduser().resolve()
         if source == output:
             raise TranscodeError("Input and output paths must be different.")
@@ -1741,6 +2078,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise TranscodeError(
                 "The output must use .mkv so all audio and subtitle track types can be preserved."
             )
+        if args.resume_state:
+            resume_entries(args.resume_state, "file", source, output)
+            cleanup_partial_output(output)
+            if output.exists():
+                args.overwrite = True
         if output.exists() and not args.overwrite:
             raise TranscodeError(f"Output already exists (use --overwrite): {output}")
         custom_cover = args.cover_image.expanduser().resolve() if args.cover_image else None
@@ -2013,7 +2355,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
             def execute_video_attempt(active_command: Sequence[str]) -> None:
-                result = run_transcode_guarded(active_command, args.system_load, fps)
+                result = run_transcode_guarded(
+                    active_command,
+                    args.system_load,
+                    fps,
+                    info.duration,
+                )
                 if result.returncode != 0:
                     raise TranscodeError(f"FFmpeg exited with status {result.returncode}.")
                 if not temporary.is_file():

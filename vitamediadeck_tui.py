@@ -37,11 +37,7 @@ import vitamediadeck_transcoder as core
 
 TABS = ("Overview", "Streams", "Settings", "Presets", "Log")
 KEY_BACK_TAB = getattr(curses, "KEY_BTAB", 353)
-VIDEO_EXTENSIONS = {
-    ".3gp", ".asf", ".avi", ".divx", ".flv", ".m2ts", ".m4v", ".mkv",
-    ".mov", ".mp4", ".mpeg", ".mpg", ".mts", ".ogm", ".ogv", ".rm",
-    ".rmvb", ".ts", ".vob", ".webm", ".wmv",
-}
+VIDEO_EXTENSIONS = core.VIDEO_EXTENSIONS
 PHASE_RANGES: dict[str, tuple[float, float, str]] = {
     "analysis": (0.00, 0.02, "ANALYZING INPUT"),
     "preflight": (0.02, 0.05, "TESTING ENCODER"),
@@ -102,6 +98,7 @@ class Settings:
         output: Path,
         audio_tracks: Sequence[int] | None = None,
         subtitle_tracks: Sequence[int] | None = None,
+        resume_state: Path | None = None,
     ) -> list[str]:
         command = [
             sys.executable,
@@ -152,6 +149,8 @@ class Settings:
             command.extend(["--cover-image", self.cover_image])
         if self.overwrite:
             command.append("--overwrite")
+        if resume_state is not None:
+            command.extend(["--resume-state", str(resume_state)])
         return command
 
 
@@ -161,7 +160,11 @@ class LiveProgress:
     phase_label: str = "IDLE"
     detail: str = ""
     phase_ratio: float = 0.0
+    local_ratio: float = 0.0
     overall_ratio: float = 0.0
+    batch_index: int = 0
+    batch_total: int = 0
+    batch_source: str = ""
     frame: str = "-"
     fps: str = "-"
     quality: str = "-"
@@ -169,6 +172,7 @@ class LiveProgress:
     bitrate: str = "-"
     speed: str = "-"
     media_seconds: float = 0.0
+    media_duration: float | None = None
     eta_seconds: float | None = None
     started_at: float = 0.0
 
@@ -325,21 +329,29 @@ class TerminalApp:
         source: Path | None,
         output: Path | None,
         initial: Settings,
+        resume_state: Path | None = None,
     ) -> None:
         self.screen = screen
         self.script = Path(__file__).with_name("vitamediadeck_transcoder.py").resolve()
         self.settings = initial
+        self.resume_state_path = resume_state.resolve() if resume_state else None
+        self.resume_saved_path: Path | None = None
         self.presets = PresetStore()
         self.input_path = source.resolve() if source else None
         self.output_path = output.resolve() if output else None
         if self.input_path and self.output_path is None:
-            self.output_path = core.default_output(self.input_path)
+            self.output_path = (
+                core.default_batch_output(self.input_path)
+                if self.input_path.is_dir()
+                else core.default_output(self.input_path)
+            )
         self.input_payload: dict[str, Any] | None = None
         self.output_payload: dict[str, Any] | None = None
         self.info: core.MediaInfo | None = None
         self.capabilities: core.Capabilities | None = None
+        self.batch_sources: list[Path] = []
         self.probe_error = ""
-        self.status = self.presets.error or "Choose an input video with O."
+        self.status = self.presets.error or "Choose an input video or folder with I."
         self.tab = 0
         self.setting_index = 0
         self.preset_index = 0
@@ -702,6 +714,20 @@ class TerminalApp:
     def draw_source_module(self, top: int, left: int, height: int, width: int) -> None:
         self.box(top, left, height, width, "INPUT VIDEO", 12)
         inner = width - 6
+        if self.input_path and self.input_path.is_dir():
+            self.centered(top + 3, left + 2, width - 4, "BATCH FOLDER SELECTED", self.color(13) | curses.A_BOLD)
+            self.centered(
+                top + 5,
+                left + 2,
+                width - 4,
+                f"{len(self.batch_sources)} VIDEO(S) FOUND RECURSIVELY",
+                self.color(4) if self.batch_sources else self.color(5),
+            )
+            self.add(top + 7, left + 3, f"ROOT {self.input_path}", self.color(8), inner)
+            self.add(top + 9, left + 3, "FILES KEEP THEIR SUBFOLDER LAYOUT", self.color(8), inner)
+            if self.probe_error:
+                self.add(top + 11, left + 3, self.probe_error, self.color(5), inner)
+            return
         if not self.info or not self.input_payload:
             self.centered(top + 3, left + 2, width - 4, "NO VIDEO SELECTED", self.color(5) | curses.A_BOLD)
             self.centered(top + 5, left + 2, width - 4, "I SELECT VIDEO  ·  U UPDATE", self.color(8))
@@ -757,6 +783,12 @@ class TerminalApp:
     def draw_target_module(self, top: int, left: int, height: int, width: int) -> None:
         self.box(top, left, height, width, "PS VITA OUTPUT", 14)
         inner = width - 6
+        if self.input_path and self.input_path.is_dir() and self.output_path:
+            self.centered(top + 3, left + 2, width - 4, "BATCH OUTPUT READY", self.color(13) | curses.A_BOLD)
+            self.centered(top + 5, left + 2, width - 4, "ONE VITAMEDIADECK MKV PER VIDEO", self.color(4))
+            self.add(top + 7, left + 3, f"ROOT {self.output_path}", self.color(8), inner)
+            self.add(top + 9, left + 3, "ORIGINAL SUBFOLDERS ARE PRESERVED", self.color(8), inner)
+            return
         if not self.info:
             self.centered(top + 3, left + 2, width - 4, "OUTPUT NOT READY", self.color(5) | curses.A_BOLD)
             self.centered(top + 5, left + 2, width - 4, "SELECT AND ANALYZE A VIDEO", self.color(8))
@@ -896,8 +928,18 @@ class TerminalApp:
         ]
         if self.input_path and self.input_path.is_file():
             lines.append(("Input size", bytes_text(self.input_path.stat().st_size), 0))
+        if self.input_path and self.input_path.is_dir():
+            lines.extend(
+                [
+                    ("Mode", "recursive folder conversion", self.color(4)),
+                    ("Videos found", str(len(self.batch_sources)), 0),
+                    ("Output layout", "mirrors the input subfolders", 0),
+                ]
+            )
         if self.probe_error:
             lines.append(("Inspection error", self.probe_error, self.color(5)))
+        if self.input_path and self.input_path.is_dir():
+            return lines
         if not self.info or not self.input_payload:
             lines.append(("Media", "press I to inspect the selected input", curses.A_DIM))
             return lines
@@ -1134,6 +1176,11 @@ class TerminalApp:
             self.add(top + 3 + row, left, text, style, width)
 
     def stream_lines(self) -> list[tuple[str, int]]:
+        if self.input_path and self.input_path.is_dir():
+            return [
+                ("Batch conversion uses every compatible audio and subtitle track.", self.color(8)),
+                ("Per-file track selection is unavailable because episodes can differ.", curses.A_DIM),
+            ]
         if not self.input_payload:
             return [("Inspect an input file to view every stream.", curses.A_DIM)]
         self.stream_cursor_line = 0
@@ -1326,7 +1373,12 @@ class TerminalApp:
                 width,
             )
         elif self.live.phase == "complete":
-            self.add(top + 3, left, "CONVERSION COMPLETE  ·  OUTPUT VERIFIED", self.color(3) | curses.A_BOLD, width)
+            complete_text = (
+                f"BATCH COMPLETE  ·  {self.live.batch_total} OUTPUT(S) VERIFIED"
+                if self.live.batch_total
+                else "CONVERSION COMPLETE  ·  OUTPUT VERIFIED"
+            )
+            self.add(top + 3, left, complete_text, self.color(3) | curses.A_BOLD, width)
         else:
             self.add(top + 3, left, "READY  ·  PRESS T TO START", self.color(8), width)
 
@@ -1340,12 +1392,17 @@ class TerminalApp:
             self.color(14) | curses.A_BOLD,
             8,
         )
-        self.add(top + 5, left, "LOCAL", self.color(13) | curses.A_BOLD, 9)
-        self.meter(top + 5, left + 10, meter_width, self.live.phase_ratio, 4)
+        local_label = (
+            f"EP {self.live.batch_index:02d}/{self.live.batch_total:02d}"
+            if self.live.batch_total
+            else "LOCAL"
+        )
+        self.add(top + 5, left, local_label, self.color(13) | curses.A_BOLD, 9)
+        self.meter(top + 5, left + 10, meter_width, self.live.local_ratio, 4)
         self.add(
             top + 5,
             left + 11 + meter_width,
-            f"{self.live.phase_ratio * 100:05.1f}%",
+            f"{self.live.local_ratio * 100:05.1f}%",
             self.color(13) | curses.A_BOLD,
             8,
         )
@@ -1358,11 +1415,17 @@ class TerminalApp:
             width,
         )
         eta = duration_text(self.live.eta_seconds) if self.live.eta_seconds is not None else "--:--:--"
+        batch_item = (
+            f"  ·  ITEM {self.live.batch_index}/{self.live.batch_total} {self.live.batch_source}"
+            if self.live.batch_total
+            else ""
+        )
         self.add(
             top + 7,
             left,
             f"MEDIA {duration_text(self.live.media_seconds)}  ·  ETA {eta}  ·  "
-            "VIDEO AND AUDIO PROCESSED SEPARATELY  ·  FINAL REMUX WITHOUT RE-ENCODING",
+            "VIDEO AND AUDIO PROCESSED SEPARATELY"
+            + batch_item,
             self.color(8),
             width,
         )
@@ -1397,7 +1460,15 @@ class TerminalApp:
     def handle_key(self, key: int) -> None:
         if key in (ord("q"), ord("Q")):
             if self.process and self.process.poll() is None:
-                if not self.confirm("A conversion is running. Cancel it and quit?"):
+                save_resume = self.confirm("Save a resume file before aborting?")
+                if save_resume:
+                    try:
+                        resume_path = self.save_resume_state()
+                    except (OSError, ValueError, core.TranscodeError) as exc:
+                        self.status = f"Could not save resume file: {exc}"
+                        return
+                    self.logs.append(f"Resume file saved: {resume_path}")
+                if not self.confirm("Abort conversion and quit?"):
                     return
                 self.cancel_conversion()
             self.running = False
@@ -1568,25 +1639,106 @@ class TerminalApp:
         if chosen is None:
             return
         self.input_path = chosen.resolve()
-        self.output_path = core.default_output(self.input_path)
+        self.resume_state_path = None
+        self.output_path = (
+            core.default_batch_output(self.input_path)
+            if self.input_path.is_dir()
+            else core.default_output(self.input_path)
+        )
         self.input_payload = None
         self.output_payload = None
         self.info = None
+        self.batch_sources = []
         self.probe_current()
+
+    def planned_resume_entries(self) -> list[dict[str, str]]:
+        if not self.input_path or not self.output_path:
+            raise ValueError("Select an input and output before saving a resume file.")
+        if self.resume_state_path:
+            state = core.load_resume_state(self.resume_state_path)
+            if (
+                Path(str(state.get("input_path") or "")).expanduser().resolve() == self.input_path
+                and Path(str(state.get("output_path") or "")).expanduser().resolve() == self.output_path
+            ):
+                entries = state.get("entries")
+                if isinstance(entries, list):
+                    return entries
+        if self.input_path.is_dir():
+            sources = self.batch_sources or core.batch_video_sources(self.input_path)
+            if not sources:
+                raise ValueError("No supported videos are available for batch resume.")
+            return [
+                {
+                    "source": str(source),
+                    "output": str(core.batch_output_path(self.input_path, self.output_path, source)),
+                }
+                for source in sources
+            ]
+        if not self.input_path.is_file():
+            raise ValueError("The selected input file no longer exists.")
+        return [{"source": str(self.input_path), "output": str(self.output_path)}]
+
+    def save_resume_state(self) -> Path:
+        if not self.input_path or not self.output_path:
+            raise ValueError("Select an input and output before saving a resume file.")
+        resume_path = self.resume_state_path
+        if resume_path is None:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            resume_path = config_directory() / "resumes" / f"vitamediadeck-{stamp}.resume.json"
+        payload = {
+            "version": core.RESUME_STATE_VERSION,
+            "mode": "batch" if self.input_path.is_dir() else "file",
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "settings": asdict(self.settings),
+            "entries": self.planned_resume_entries(),
+            "saved_at": int(time.time()),
+        }
+        resume_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = resume_path.with_suffix(resume_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, resume_path)
+        try:
+            resume_path.chmod(0o600)
+        except OSError:
+            pass
+        self.resume_state_path = resume_path.resolve()
+        self.resume_saved_path = self.resume_state_path
+        return self.resume_state_path
 
     def edit_output(self) -> None:
         current = str(self.output_path or "")
-        value = self.prompt("Output .mkv path", current)
+        is_batch = bool(self.input_path and self.input_path.is_dir())
+        value = self.prompt("Output folder" if is_batch else "Output .mkv path", current)
         if value:
             candidate = Path(value).expanduser()
-            if candidate.suffix.lower() != ".mkv":
+            if not is_batch and candidate.suffix.lower() != ".mkv":
                 candidate = candidate.with_suffix(".mkv")
             self.output_path = candidate.resolve()
-            self.status = "Output path updated."
+            self.status = "Output folder updated." if is_batch else "Output path updated."
 
     def probe_current(self) -> None:
-        if not self.input_path or not self.input_path.is_file():
-            self.status = "Select a valid input file first."
+        if not self.input_path or not (self.input_path.is_file() or self.input_path.is_dir()):
+            self.status = "Select a valid input video or folder first."
+            return
+        if self.input_path.is_dir():
+            self.info = None
+            self.input_payload = None
+            self.output_payload = None
+            self.capabilities = None
+            self.track_choices = []
+            self.selected_audio_tracks.clear()
+            self.selected_subtitle_tracks.clear()
+            self.batch_sources = core.batch_video_sources(self.input_path)
+            if not self.batch_sources:
+                self.probe_error = "No supported video files found recursively."
+                self.status = "No videos found in the selected folder."
+            else:
+                self.probe_error = ""
+                self.status = (
+                    f"Batch ready: {len(self.batch_sources)} video(s) found. "
+                    "Press T to convert recursively."
+                )
             return
         self.status = "Inspecting media and FFmpeg capabilities..."
         self.draw()
@@ -1650,18 +1802,35 @@ class TerminalApp:
         if self.process and self.process.poll() is None:
             self.status = "A conversion is already running."
             return
-        if not self.input_path or not self.input_path.is_file() or not self.output_path:
-            self.status = "Select and inspect an input file first."
+        if not self.input_path or not (self.input_path.is_file() or self.input_path.is_dir()) or not self.output_path:
+            self.status = "Select and inspect an input video or folder first."
+            return
+        is_batch = self.input_path.is_dir()
+        if is_batch and not self.batch_sources:
+            self.status = "No videos found in the selected folder."
+            return
+        if is_batch and (self.output_path == self.input_path or self.input_path in self.output_path.parents):
+            self.status = "Choose an output folder outside the input folder."
             return
         if self.settings.cover_mode == "custom" and not Path(self.settings.cover_image).expanduser().is_file():
             self.status = "Select a valid custom cover image in Settings."
             return
-        command = self.settings.command(
-            self.script,
-            self.input_path,
-            self.output_path,
-            sorted(self.selected_audio_tracks),
-            sorted(self.selected_subtitle_tracks),
+        command = (
+            self.settings.command(
+                self.script,
+                self.input_path,
+                self.output_path,
+                resume_state=self.resume_state_path,
+            )
+            if is_batch
+            else self.settings.command(
+                self.script,
+                self.input_path,
+                self.output_path,
+                sorted(self.selected_audio_tracks),
+                sorted(self.selected_subtitle_tracks),
+                self.resume_state_path,
+            )
         )
         self.logs.clear()
         self.logs.append("$ " + core.command_text(command))
@@ -1744,9 +1913,14 @@ class TerminalApp:
                     self.live.phase = "complete"
                     self.live.phase_label = "COMPLETE"
                     self.live.phase_ratio = 1.0
+                    self.live.local_ratio = 1.0
                     self.live.overall_ratio = 1.0
                     self.live.eta_seconds = 0.0
-                    self.status = "Conversion completed and validated successfully."
+                    self.status = (
+                        f"Batch completed: {self.live.batch_total} output(s) validated successfully."
+                        if self.live.batch_total
+                        else "Conversion completed and validated successfully."
+                    )
                     self.inspect_output()
                 else:
                     self.status = f"Conversion failed with exit status {value}. See Log."
@@ -1757,7 +1931,45 @@ class TerminalApp:
                 self.logs.append(f"Error: {value}")
                 self.status = f"Could not start conversion: {value}"
 
+    def apply_batch_context(self, payload: dict[str, Any]) -> None:
+        """Start a new local meter when a recursive batch advances to an episode."""
+        try:
+            index = int(payload.get("batch_index") or 0)
+            total = int(payload.get("batch_total") or 0)
+        except (TypeError, ValueError):
+            return
+        if not (1 <= index <= total):
+            return
+        if index != self.live.batch_index or total != self.live.batch_total:
+            self.live.phase_ratio = 0.0
+            self.live.local_ratio = 0.0
+            self.live.media_seconds = 0.0
+            self.live.media_duration = None
+            self.live.eta_seconds = None
+            self.live.frame = "-"
+            self.live.fps = "-"
+            self.live.quality = "-"
+            self.live.size = "-"
+            self.live.bitrate = "-"
+            self.live.speed = "-"
+            self.live.overall_ratio = (index - 1) / total
+        self.live.batch_index = index
+        self.live.batch_total = total
+        self.live.batch_source = str(payload.get("batch_source") or "")
+
+    def set_local_progress(self, ratio: float) -> None:
+        self.live.local_ratio = max(self.live.local_ratio, max(0.0, min(1.0, ratio)))
+        if self.live.batch_total:
+            self.live.overall_ratio = min(
+                1.0,
+                (self.live.batch_index - 1 + self.live.local_ratio)
+                / self.live.batch_total,
+            )
+        else:
+            self.live.overall_ratio = self.live.local_ratio
+
     def handle_machine_progress(self, payload: dict[str, Any]) -> None:
+        self.apply_batch_context(payload)
         phase = str(payload.get("phase") or "unknown")
         state = str(payload.get("state") or "start")
         detail = str(payload.get("detail") or "")
@@ -1773,24 +1985,40 @@ class TerminalApp:
             self.live.detail = detail
             self.status = "Conversion cancelled."
             return
-        start, end, label = PHASE_RANGES.get(phase, (self.live.overall_ratio, self.live.overall_ratio, phase.upper()))
+        start, end, label = PHASE_RANGES.get(
+            phase,
+            (self.live.local_ratio, self.live.local_ratio, phase.upper()),
+        )
         self.live.phase = phase
         self.live.phase_label = label
         self.live.detail = detail
         if state == "start":
             self.live.phase_ratio = 0.0
-            self.live.overall_ratio = max(self.live.overall_ratio, start)
+            self.set_local_progress(start)
         elif state in {"done", "skipped"}:
             self.live.phase_ratio = 1.0
-            self.live.overall_ratio = max(self.live.overall_ratio, end)
+            self.set_local_progress(end)
         elif state == "fallback":
             self.live.phase_ratio = max(self.live.phase_ratio, 0.25)
+            self.set_local_progress(start + (end - start) * self.live.phase_ratio)
         elif state == "stage":
             self.live.phase_ratio = max(self.live.phase_ratio, 0.88)
-            self.live.overall_ratio = max(
-                self.live.overall_ratio,
-                start + (end - start) * self.live.phase_ratio,
+            self.set_local_progress(start + (end - start) * self.live.phase_ratio)
+        elif state == "progress":
+            try:
+                phase_progress = float(payload.get("progress"))
+            except (TypeError, ValueError):
+                phase_progress = 0.0
+            self.live.phase_ratio = max(
+                self.live.phase_ratio,
+                max(0.0, min(1.0, phase_progress)),
             )
+            self.set_local_progress(start + (end - start) * self.live.phase_ratio)
+            try:
+                self.live.media_seconds = float(payload.get("media_seconds"))
+                self.live.media_duration = float(payload.get("duration"))
+            except (TypeError, ValueError):
+                pass
         self.status = self.progress_status()
 
     def update_ffmpeg_stats(self, line: str) -> None:
@@ -1823,31 +2051,34 @@ class TerminalApp:
         )
         self.progress_seconds = media_seconds
         self.live.media_seconds = media_seconds
-        if not self.info or not self.info.duration:
+        duration = self.live.media_duration or (self.info.duration if self.info else None)
+        if not duration:
             return
-        ratio = max(0.0, min(1.0, media_seconds / self.info.duration))
+        ratio = max(0.0, min(1.0, media_seconds / duration))
         self.live.phase_ratio = max(self.live.phase_ratio, ratio)
         start, end, _ = PHASE_RANGES[self.live.phase]
-        self.live.overall_ratio = max(
-            self.live.overall_ratio,
-            start + (end - start) * ratio,
-        )
+        self.set_local_progress(start + (end - start) * ratio)
         try:
             speed = float(self.live.speed.rstrip("x"))
-            self.live.eta_seconds = max(0.0, self.info.duration - media_seconds) / speed
+            self.live.eta_seconds = max(0.0, duration - media_seconds) / speed
         except (TypeError, ValueError, ZeroDivisionError):
             self.live.eta_seconds = None
         self.status = self.progress_status()
 
     def progress_status(self) -> str:
+        local_label = (
+            f"ITEM {self.live.batch_index}/{self.live.batch_total}"
+            if self.live.batch_total
+            else "LOCAL"
+        )
         if self.paused:
             return (
-                f"PAUSED: {self.live.phase_label} {self.live.phase_ratio * 100:.1f}%"
+                f"PAUSED: {local_label} {self.live.local_ratio * 100:.1f}%"
                 f" · OVERALL {self.live.overall_ratio * 100:.1f}% · PRESS P TO RESUME"
             )
         detail = f" · {self.live.detail}" if self.live.detail else ""
         return (
-            f"{self.live.phase_label}: {self.live.phase_ratio * 100:.1f}%"
+            f"{self.live.phase_label}: {local_label} {self.live.local_ratio * 100:.1f}%"
             f" · OVERALL {self.live.overall_ratio * 100:.1f}%{detail}"
         )
 
@@ -2079,7 +2310,7 @@ class TerminalApp:
             self.add(
                 height - 2,
                 1,
-                " [ENTER] SELECT/OPEN   [BACKSPACE] PARENT   [H] HIDDEN   [ESC] CANCEL ",
+                " [ENTER] SELECT/OPEN   [D] SELECT FOLDER   [BACKSPACE] PARENT   [H] HIDDEN   [ESC] CANCEL ",
                 self.color(6) | curses.A_BOLD,
                 width - 2,
             )
@@ -2101,6 +2332,8 @@ class TerminalApp:
             elif key in (ord("h"), ord("H")):
                 show_hidden = not show_hidden
                 selected = 0
+            elif key in (ord("d"), ord("D")):
+                return current
             elif key in (10, 13):
                 chosen = entries[selected]
                 if chosen.is_dir():
@@ -2112,11 +2345,12 @@ class TerminalApp:
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Terminal UI for VitaMediaDeck Transcoder")
-    parser.add_argument("input", type=Path, nargs="?", help="optional input video")
-    parser.add_argument("output", type=Path, nargs="?", help="optional output .mkv path")
+    parser.add_argument("input", type=Path, nargs="?", help="optional input video or folder")
+    parser.add_argument("output", type=Path, nargs="?", help="optional output .mkv path or folder")
     parser.add_argument("--preset", help="load a built-in or saved preset")
     parser.add_argument("--ffmpeg", default="ffmpeg", help="FFmpeg executable or path")
     parser.add_argument("--ffprobe", default="ffprobe", help="ffprobe executable or path")
+    parser.add_argument("--resume-state", type=Path, help="load a saved interrupted conversion")
     parser.add_argument("--list-presets", action="store_true", help="list presets without opening the UI")
     return parser.parse_args(argv)
 
@@ -2144,15 +2378,35 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Error: the terminal UI requires an interactive terminal.", file=sys.stderr)
         return 2
-    settings = selected_settings(args, store)
+    if args.resume_state:
+        if args.input or args.output or args.preset:
+            raise SystemExit("--resume-state cannot be combined with input, output, or --preset.")
+        state = core.load_resume_state(args.resume_state)
+        saved_settings = state.get("settings")
+        if not isinstance(saved_settings, dict):
+            raise SystemExit("The resume state does not contain valid conversion settings.")
+        settings = Settings.from_dict(saved_settings)
+        source = Path(str(state.get("input_path") or "")).expanduser()
+        output = Path(str(state.get("output_path") or "")).expanduser()
+    else:
+        settings = selected_settings(args, store)
+        source = args.input
+        output = args.output
+
+    app_holder: dict[str, TerminalApp] = {}
 
     def wrapped(screen: Any) -> None:
-        TerminalApp(screen, args.input, args.output, settings).run()
+        app = TerminalApp(screen, source, output, settings, args.resume_state)
+        app_holder["app"] = app
+        app.run()
 
     try:
         curses.wrapper(wrapped)
     except KeyboardInterrupt:
         return 130
+    saved_resume = app_holder.get("app")
+    if saved_resume and saved_resume.resume_saved_path:
+        print(f"Resume file saved: {saved_resume.resume_saved_path}")
     return 0
 
 
