@@ -1,304 +1,356 @@
 # VitaMediaDeck Transcoder
 
-Standalone Python utility that converts videos on macOS, Windows, and Linux
-into files optimised for VitaMediaDeck on PlayStation Vita. It is an external
-host tool: it is not included in the VPK.
+**1.1.0-beta.1** · `beta` branch · based on `dev`
 
-![VitaMediaDeck Transcoder overview](docs/images/tui-overview.png)
+A terminal AV editor and FFmpeg transcoder for preparing movies and series for
+[VitaMediaDeck on PlayStation Vita](https://github.com/spyro-98/VitaMediaDeck).
+Adjust video and audio settings, compare the converted preview with the source,
+choose tracks and review the result before converting the complete file.
 
-![VitaMediaDeck Transcoder conversion log](docs/images/tui-conversion.png)
+This runs on your **computer**. It is a separate host tool, not part of the VPK.
+The editor changes conversion settings; it does not cut or modify your source.
 
-## Input and output formats
+[Getting started](#getting-started) · [Controls](#editor-controls) ·
+[Presets](#vita-playback-presets) · [Folders and recovery](#folders-and-recovery) ·
+[Changelog](CHANGELOG.md) · [Validation](docs/validation.md)
 
-Input support is provided by the installed FFmpeg build rather than a fixed
-extension allowlist. Any file containing a video stream that FFmpeg and
-FFprobe can decode can be inspected and converted. Audio-only files are not
-accepted by this video transcoder.
+## What is new in this beta
 
-Common supported inputs include:
+- Always-visible AV preview with manually started playback, synchronized audio,
+  captions and filmstrip. Parameters occupy the left quarter of the editor;
+  video uses the remaining width, with track lanes below.
+- Original on the left, processed output on the right: toggle the comparison,
+  drag its divider and keep your position while adjusting settings.
+- Nine numbered sections, clear focus, categorized parameters and compact
+  source → output information. Presets show what they change before application.
+- A fresh preview after every parameter or track change, including returning to
+  an earlier configuration. **No preview-result cache.**
+- Vita HW/SW playback presets, optional filters and measured CPU/GPU selection.
+- Per-video output folders, safe replacement, resumable queues and progress
+  that starts at zero for every video.
 
-| Type | Representative formats |
-| --- | --- |
-| Containers | Matroska/WebM (`.mkv`, `.webm`), MP4/M4V/MOV, AVI, MPEG-TS/M2TS, MPEG/VOB, WMV/ASF, FLV, OGV and 3GP |
-| Video | H.264/AVC, H.265/HEVC including 10-bit HDR, AV1, VP8/VP9, MPEG-1/2, MPEG-4 Part 2/DivX/Xvid, VC-1/WMV, ProRes and DNxHD/DNxHR |
-| Audio inside the video | AAC/HE-AAC, MP3, AC-3, E-AC-3, DTS, TrueHD/MLP, FLAC, ALAC, Opus, Vorbis, PCM/WAV and WMA |
-| Embedded subtitles | SRT/SubRip, ASS/SSA, WebVTT, MOV text, PGS and VobSub/DVD subtitles |
+This is a prerelease. Host checks and physical Vita/terminal testing are
+distinct; see [validation scope](docs/validation.md#remaining-runtime-checks).
 
-This list is representative rather than exhaustive. A format is available
-only when the selected FFmpeg build contains its demuxer and decoder. Use a
-full FFmpeg build for the widest input coverage.
+## Getting started
 
-Every successful conversion has one predictable VitaMediaDeck contract:
-
-| Output component | Format |
-| --- | --- |
-| Container | Seekable Matroska (`.mkv`) |
-| Video | H.264 High Profile, Level 3.1 up to 30 fps or Level 3.2 above 30 fps |
-| Image | 960×544 canvas, preserved aspect ratio, 8-bit `yuv420p`, BT.709 limited range |
-| Frame rate | Original source cadence, never increased, capped at 60 fps |
-| Audio | Every selected track converted to AAC-LC, mono/stereo, 48 kHz; target bitrate never exceeds the measured source-track bitrate |
-| Subtitles | Selected compatible embedded tracks retained; MOV text, generic text and WebVTT are converted to SRT |
-| Metadata | Chapters, language/title metadata and compatible Matroska font attachments retained |
-| Cover | Embedded 480×272 `cover.jpg`; existing artwork has priority, otherwise a representative frame is generated |
-
-Matroska is deliberate: unlike MP4, it can retain ASS, PGS, VobSub and subtitle
-font attachments alongside multiple audio tracks. Near-black generated artwork
-is rejected and retried at a distant timestamp.
-
-## Requirements
-
-- Python 3.9 or newer;
-- `ffmpeg` and `ffprobe` on `PATH`;
-- current graphics drivers for hardware encoding.
-
-The automatic encoder order is VideoToolbox on macOS, NVENC on NVIDIA,
-AMF on AMD, VAAPI on Linux AMD/Intel, then `libx264` as the reliable fallback.
-The tool runs a short frame-counted preflight and tries the next safe path if
-an encoder cannot produce valid frames.
-
-For 4K HDR input, FFmpeg must provide `zscale` and `tonemap`:
+Requirements: **Python 3.9+**, FFmpeg and FFprobe. **FFplay** is required for
+synchronized AV preview with audio. Use an interactive terminal and a large
+window for the editor. The selected FFmpeg build must support your source and
+chosen encoder/filters; HDR conversion needs `zscale` and `tonemap`.
 
 ```sh
-ffmpeg -hide_banner -filters | grep -E 'zscale|tonemap'
+git clone --branch beta https://github.com/spyro-98/VitaMediaDeck-Transcoder.git
+cd VitaMediaDeck-Transcoder
+python3 vitamediadeck_tui.py
 ```
 
-On macOS, Homebrew's `ffmpeg-full` is detected automatically when installed.
+Open a movie or series folder directly, optionally selecting a preset:
+
+```sh
+python3 vitamediadeck_tui.py "Movie.mkv"
+python3 vitamediadeck_tui.py "My Series" "Converted Series"
+python3 vitamediadeck_tui.py "Movie.mkv" --preset "Vita HW - Medium"
+python3 vitamediadeck_tui.py --list-presets
+```
+
+On macOS, a Homebrew `ffmpeg-full` installation is detected automatically:
 
 ```sh
 brew install ffmpeg-full
 ```
 
-## Troubleshooting
-
-If FFprobe reports an error such as `0x00 at pos 0 invalid as first byte of an
-EBML number`, the selected file is not a valid Matroska file at byte zero. It
-is normally a corrupt or incomplete copy, not a missing FFmpeg dependency.
-Select the actual video rather than a macOS `._` sidecar file, then copy or
-download the source again before converting it.
-
-## Quick start
-
-Convert a video with the recommended Vita profile:
-
-```sh
-python3 vitamediadeck_transcoder.py input.mkv
-```
-
-Choose an output path, inspect the planned FFmpeg command, or select an
-encoder explicitly:
-
-```sh
-python3 vitamediadeck_transcoder.py input.mp4 output.vitamediadeck.mkv
-python3 vitamediadeck_transcoder.py input.mov --dry-run
-python3 vitamediadeck_transcoder.py input.mkv --encoder x264
-python3 vitamediadeck_transcoder.py anime.mkv --encoder x264 --content-tune anime
-```
-
-### Convert a series folder
-
-Pass a folder instead of one video to convert every supported video file inside
-it, including all subfolders. The output is a separate sibling folder by
-default, and it mirrors the input layout so seasons and episode folders remain
-organized. Each output file receives the `.vitamediadeck.mkv` suffix.
-
-```sh
-python3 vitamediadeck_transcoder.py "My Series"
-python3 vitamediadeck_transcoder.py "My Series" "Vita-ready Series"
-```
-
-For example, `My Series/Season 01/Episode 01.mkv` becomes
-`Vita-ready Series/Season 01/Episode 01.vitamediadeck.mkv`. The destination
-must be outside the source folder; batch conversion runs one file at a time and
-continues with later episodes if one file fails. In the TUI, press `I`, browse
-to the series root, then press `D` to select that folder.
-
-Discovery is strictly bounded to that selected root: only supported media below
-it is converted, recursively. Sibling folders, parent-folder media, and files
-reached through symlinks that resolve outside the selected root are excluded.
-Open the **Batch** tab to inspect the complete numbered list of discovered,
-relative paths before starting.
-
-In **Batch**, use the arrow keys to navigate a media item and `Enter` to edit
-its own conversion settings. The **Settings** tab then identifies the active
-media; its values override the global defaults only for that item. Press `G`
-there to propagate the highlighted setting to every discovered compatible
-media, or press `R` in **Batch** to return one item to the global defaults.
-Pressing `G` in **Batch** clears all per-media overrides and restores the
-global defaults for the whole folder. Per-media settings are saved into the
-batch plan and resume file, so an interrupted folder conversion keeps them.
-
-During a batch, **TOTAL** reports progress across the complete folder while
-**EP** reports progress for the current episode. The current episode is shown
-as `EP 03/12`, including its source-relative path.
-
-### Save and resume an interrupted conversion
-
-When a conversion is active, press `Q`. The interface asks whether to save a
-resume file before it aborts and exits. The file freezes the original input and
-output paths, the selected settings, and the exact list of input/output files;
-the terminal prints its path after the interface closes. Resume it with:
-
-```sh
-python3 vitamediadeck_tui.py --resume-state "/path/to/vitamediadeck-YYYYMMDD-HHMMSS.resume.json"
-```
-
-For scripted use, pass the same state to the CLI with the original source and
-destination paths:
-
-```sh
-python3 vitamediadeck_transcoder.py "My Series" "Vita-ready Series" --resume-state "/path/to/resume.json"
-```
-
-For a series folder, completed files are independently revalidated and skipped.
-Temporary partial files created by the converter are removed automatically, and
-only their incomplete episode is encoded again. FFmpeg cannot safely continue
-from the middle of an incomplete Matroska encode, so that one episode restarts
-from its beginning; completed episodes remain untouched. A resume file rejects
-changed input/output paths, missing source files, or a changed saved file list.
-
-Launch the terminal interface:
-
-```sh
-python3 vitamediadeck_tui.py
-```
-
-Or start it with a video and a preset:
-
-```sh
-python3 vitamediadeck_tui.py input.mkv output.vitamediadeck.mkv
-python3 vitamediadeck_tui.py input.mkv --preset "Balanced"
-```
-
-On Windows only, install the TUI dependencies once. They provide the `curses`
-compatibility layer and process-tree pause/resume support:
+On Windows, install the terminal dependencies, then start with `py`:
 
 ```powershell
 py -m pip install -r requirements-tui.txt
 py vitamediadeck_tui.py
 ```
 
-### Windows executable
+Linux users can run the same Python entry points with an FFmpeg installation
+that includes FFprobe and FFplay. `--ffmpeg` and `--ffprobe` accept explicit paths.
 
-Every published GitHub release includes `VitaMediaDeck-Transcoder.exe`, a
-console executable that opens the terminal interface directly. FFmpeg and
-FFprobe remain external dependencies: install them and make both available on
-`PATH` before launching the executable.
+Check the version with either entry point:
 
-To build it locally on Windows:
+```sh
+python3 vitamediadeck_tui.py --version
+python3 vitamediadeck_transcoder.py --version
+```
+
+Keep **all Python files in this repository together** when running from source.
+The editor and conversion worker share the `vmd_*.py` modules.
+
+## Editor controls
+
+The editor opens on the source information. The top menu contains:
+
+| Section | Purpose |
+| --- | --- |
+| **1 Info** | File, video, colour, audio, subtitle and attachment metadata |
+| **2 Presets** | Descriptions, setting changes and estimated current → preset results |
+| **3 General** | Resource policy, tools, cover and output options |
+| **4 Video** | Encoder, quality, frame rate, HDR, resizing and optional filters |
+| **5 Audio** | Inclusion, source/output channels and bitrate per selected track |
+| **6 Subtitles** | Included/excluded tracks and synchronized caption activity |
+| **7 Review** | Changed parameters, source/output summary, retained tracks and size estimates |
+| **8 Queue** | Recursive file list, per-media settings, inclusion, order and progress |
+| **9 Log** | Processing output and detailed errors |
+
+The active tab, panel border and highlighted row identify focus. Long parameters
+wrap and use pages; preset/queue lists use the available height. The minimum
+layout is 76 columns × 22 rows.
+
+| Key | Action |
+| --- | --- |
+| `1`–`9`, Tab / Shift-Tab | Select a section / move focus |
+| ↑ / ↓ | Select a parameter, preset or track |
+| ← / →, `-` / `+` | Decrease / increase a parameter; numeric values stop at their limits |
+| Enter | Edit a value, apply a preset or toggle the selected track/item |
+| PageUp / PageDown | Page through focused content/details |
+| `I` / `O` / `U` | Choose input / output / refresh inspection and preview |
+| `N` | Save a named preset |
+| `D` in Presets | Delete the selected custom preset |
+| `S` in General/Video/Audio | Apply the field or bitrate to compatible queued files |
+| `R` in Queue | Restore global defaults for the selected file |
+| `T` | Open Review; press again in Review to start conversion |
+| `P` / `A` | Pause or resume full conversion / abort it |
+| `Q` | Confirm exit; if converting, offer a recovery file before cancelling |
+
+In **Audio** or **Subtitles**, select a track and press **Enter** to include or
+exclude it. Delete/Backspace excludes the selected track; **X** excludes all
+and **E** includes all in that section. Excluded lanes are dimmed. **J** changes
+the listening track without changing export inclusion.
+
+### Preview playback and comparison
+
+| Key | Action |
+| --- | --- |
+| Space / `V` | Play, pause or replay; playback never starts automatically |
+| `Z` | Toggle Fit window / Vita 960×544 size, reduced if needed |
+| `C` | Toggle original/processed comparison, retaining the divider position |
+| `,` / `.` | Move the divider left / right |
+| Mouse click / drag in video | Position the divider, when supported by the terminal |
+| `[` / `]` | Previous / next source sample |
+| `<` / `>` | Move ten samples backward / forward |
+| `G` | Choose sample 1–100 |
+| Home / End | First / last previewable part of the movie |
+| `{` / `}` | Previous / next random audio excerpt |
+| `L` | Play or stop the selected converted audio excerpt |
+| `H` | Filter support and processing alternatives; `/` searches filters |
+
+Navigation offers **100 evenly spaced source positions**, initially at 20% of
+the movie. Each preview converts up to six seconds. Ten random audio excerpts
+provide additional listening points within the source.
+
+Every setting or inclusion change rebuilds video, selected audio, subtitles,
+frames, thumbnails, waveforms and comparison data from the original. Automatic
+CPU/GPU choices are measured again. Superseded workers are cancelled, old
+images are cleared and only the completed current preview can be displayed or
+played. Playback time and comparison-divider position are retained.
+
+Temporary files and buffers belong only to the current sample. Replay, pause
+and divider movement use that sample; they do not retrieve earlier settings.
+Preview caches from older versions are ignored. Named presets and recovery
+files remain supported.
+
+The right side is decoded from the **actual encoded preview**. The left fits
+the source to the same canvas without selected enhancement filters; HDR needs
+a fixed conversion for the SDR terminal. Text subtitle lanes show timed plain
+captions. Bitmap subtitles show timed graphic activity rather than OCR text;
+retained ASS styling remains in the converted file.
+
+The waveform indicates sound level, **not quality or progress**. Audio drives
+the AV clock. Pause closes the player; resume uses PCM trimmed to the held
+position. One included track is auditioned at a time, while all are exported.
+
+Kitty graphics, iTerm2 inline images, Sixel and coloured Unicode half blocks
+are chosen according to the terminal. Override with `VMD_PREVIEW=kitty`,
+`iterm2`, `sixel` or `unicode`. Unicode is the fallback for unsupported terminals
+and multiplexers. Vita-size display is approximate if cell dimensions are unknown.
+
+## Vita playback presets
+
+**HW and SW refer to the decoder on the Vita**, independently of the computer's
+encoding hardware. Choose the corresponding playback decoder in VitaMediaDeck.
+
+| Preset | Video quality | FPS ceiling | AAC ceiling per included track |
+| --- | --- | --- | --- |
+| Vita HW - Max perceptual | Maximum | 60 | 576 kb/s |
+| Vita HW - Medium | Balanced | 60 | 160 kb/s |
+| Vita HW - Light | Compact | 30 | 128 kb/s |
+| Vita SW - Max perceptual | Maximum | 30 | 576 kb/s |
+| Vita SW - Medium | Balanced | 30 | 160 kb/s |
+| Vita SW - Light | Compact | 30 | 128 kb/s |
+
+Audio targets are capped by each source track's measured bitrate. SW presets
+use x264 fast-decode tuning, no B-frames and one reference frame to reduce
+decoder work. These are starting points, not a guarantee for every Vita/source/
+clock combination. Lower bitrate alone does not ensure lower decoding cost.
+
+**Max perceptual** is the highest configured detail budget, not lossless output
+or reconstruction of absent source detail. Other presets address film grain,
+animation, noisy footage, gradients, soft sources and Mac GPU paths. Read the
+description and current → preset comparison before application.
+
+### Quality, bitrate and filters
+
+- Initial settings favor **Maximum**, up to 60 fps, source-capped 576 kb/s audio
+  and full processing resources. Enhancement filters start **off**.
+- Maximum targets about 3.0 Mb/s at 24 fps, 3.5 Mb/s at 30 fps and 7.0 Mb/s
+  at 60 fps. These are configured budgets, not guaranteed achieved bitrates.
+- Bitrates are not directly comparable across codecs. A larger H.264 file
+  cannot restore detail already lost in an HEVC source.
+- Audio bitrate applies to **one complete stereo track**, not each channel.
+  AC3 640 kb/s across six channels → AAC 192 kb/s across two channels gives
+  arithmetic averages of 106.7 → 96 kb/s/channel. Bits are shared dynamically;
+  this calculation does not measure perceived quality.
+- Denoising can remove grain and texture, sharpening can add halos, and
+  debanding can soften gradients. Compare filters before using them.
+  No MLX enhancement model is bundled.
+- Size/compression estimates use duration, video budgets, retained audio and
+  optional preview measurements. A short sample cannot predict every scene;
+  estimated and measured results are labelled separately.
+
+**Auto** measures complete compatible pipelines: decoding, filters, CPU/GPU
+transfers and encoding. Close timings favor hardware encoding; filter
+alternatives need a 15% timing advantage. High/Maximum automatic resizing keeps
+Lanczos. An explicit encoder stays fixed while Auto filters/resizing can still
+be measured.
+
+VideoToolbox is Apple's hardware H.264 encoder. NVENC, AMF and VAAPI cover
+compatible NVIDIA, AMD and Linux hardware. x264 encodes on the CPU. Compatible
+Apple resizing/Core Image filters can run on GPU even with x264; operations
+such as the selected HDR tone mapper or standard NLMeans remain on CPU.
+CPU/GPU filters may use different algorithms and produce different pixels.
+See [GPU processing and limitations](docs/gpu-processing.md).
+
+## Folders and recovery
+
+Each converted video has its own folder. **The original stays outside it.**
+
+```text
+Movies/
+  Movie.mkv
+  Movie.vitamediadeck/
+    Movie.vitamediadeck.mkv
+    resume.json
+    report.json
+    transcode.log                 # TUI/batch log, when present
+```
+
+An explicit output `Exports/Film.mkv` becomes `Exports/Film/Film.mkv`.
+Specifying that final path again does not nest it twice. New jobs do not create
+a shared `VitaMediaDeck-support` folder.
+
+Directory conversion recursively scans **only the selected root**. Siblings,
+parent folders, external symlink targets and recognized generated conversion
+folders are excluded. Season/subfolder paths are preserved:
+
+```text
+My Series/Season 01/Episode 01.mkv
+Converted Series/Season 01/Episode 01.vitamediadeck/
+  Episode 01.vitamediadeck.mkv
+  resume.json
+  report.json
+  transcode.log
+```
+
+Review discovered paths in **Queue**. Each included file can have its own
+settings and track selection. Batch-level `resume.json`, `report.json`,
+`batch-plan.json` and `session.log` live in the selected batch output root;
+each episode also has its own conversion data.
+
+During conversion, the preview stays frozen and its audio stops. Playback and
+preview regeneration are locked to avoid competing with encoding. The
+filmstrip becomes a full-video progress strip: dark at **0%**, lighting from
+left to right as frames are encoded. Loading/calibration do not count as video
+progress. Every queued video starts at zero; queue progress is duration-weighted.
+Audio, assembly and validation are separate phases.
+
+For an existing output the TUI asks for confirmation; the CLI requires
+`--overwrite`. Replacement happens **only after validation**. Cancellation or
+failure preserves the old finished video; sources cannot be overwritten.
+
+Press **Q** during conversion to save recovery data and cancel before exiting.
+Resume with:
+
+```sh
+python3 vitamediadeck_tui.py --resume-state "/path/to/conversion/resume.json"
+```
+
+Recovery requires the same paths and unchanged sources. Completed outputs are
+validated and skipped. Converter partials are removed; an incomplete episode
+restarts from its beginning. Older saved jobs retain their paths and remain readable.
+
+## Command-line conversion
+
+The noninteractive worker supports individual videos and recursive folders:
+
+```sh
+python3 vitamediadeck_transcoder.py "Movie.mkv"
+python3 vitamediadeck_transcoder.py "My Series" "Converted Series"
+python3 vitamediadeck_transcoder.py "Movie.mkv" --dry-run
+python3 vitamediadeck_transcoder.py "Movie.mkv" --encoder x264 --quality balanced
+python3 vitamediadeck_transcoder.py "Movie.mkv" --audio-track 0 --no-subtitles
+python3 vitamediadeck_transcoder.py "Movie.mkv" --system-load balanced
+```
+
+CLI track indices are **zero-based**. Repeat `--audio-track` or `--subtitle-track`
+for multiple tracks; all are selected by default. Use `--no-audio` or
+`--no-subtitles` to exclude an entire type. CLI recovery uses the same paths:
+
+```sh
+python3 vitamediadeck_transcoder.py "My Series" "Converted Series" \
+  --resume-state "Converted Series/resume.json"
+```
+
+Run either entry point with `--help` for its options. Named presets belong to
+the editor; the worker accepts their individual settings as flags.
+
+## Output contract
+
+FFmpeg determines input support. Common sources include MKV/MP4/MOV/WebM/AVI,
+HEVC, H.264, AV1, VP9, MPEG video and multichannel/lossless audio. Single-file
+inputs are probed; folder discovery uses the supported media extension list.
+
+| Component | Result |
+| --- | --- |
+| Container | Seekable Matroska (`.mkv`) |
+| Video | H.264 High Profile, Level 3.1 through 30 fps / 3.2 above 30 fps |
+| Image | 960×544 canvas, preserved source aspect ratio with padding |
+| Colour | 8-bit `yuv420p`, BT.709 limited range; detected HDR is tone-mapped to SDR |
+| Frame rate | Original cadence capped by the selected ceiling, never increased, at most 60 fps |
+| Audio | Selected tracks converted to AAC-LC, 48 kHz stereo, source-capped target bitrate |
+| Subtitles | Selected tracks retained; MOV text/generic text/WebVTT become SRT |
+| Metadata | Chapters, language/title metadata and compatible font attachments retained |
+| Cover | Embedded 480×272 `cover.jpg`, from custom image, existing artwork or a frame |
+
+## Troubleshooting and validation
+
+- Unsupported image protocols fall back to Unicode. Use `VMD_PREVIEW=unicode`
+  to investigate terminal compatibility; preview audio requires FFplay.
+- Missing encoders/filters appear in **Log**. Compiled GPU filter names do not
+  prove driver/device availability; Auto performs runtime trials.
+- Invalid EBML/Matroska headers can indicate a damaged/incomplete source or a
+  macOS `._` sidecar. Select the real media before retrying.
+- Low quality can hide grain; enhancement filters can remove it. Use the split
+  and disable filters when preserving texture matters.
+
+See [validation commands and proof boundaries](docs/validation.md) for the
+automated checks. The Windows packaging workflow builds a console executable;
+FFmpeg tools remain external dependencies. To build locally:
 
 ```powershell
 py -m pip install -r requirements-tui.txt pyinstaller
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
 ```
 
-The output is `artifacts\windows\VitaMediaDeck-Transcoder.exe`.
+Output: `artifacts/windows/VitaMediaDeck-Transcoder.exe`. A beta branch push does
+not itself publish a GitHub release or certify that executable.
 
-## Terminal interface
+## Related projects
 
-The TUI includes a file browser, input/output inspection, encoder and quality
-settings, editable presets, per-track audio/subtitle selection, live FFmpeg
-logs, progress, speed, bitrate, ETA, process-level pause/resume, cancellation,
-and final validation.
-
-| Key | Action |
-| --- | --- |
-| `I` / `O` / `U` | Select input video/folder / edit output path / refresh media analysis |
-| `T` / `A` | Start / abort conversion |
-| `P` | Pause or resume the complete transcoding process tree |
-| `Tab`, `Shift+Tab`, `1`–`6` | Change page |
-| Arrow keys, `Space` | Navigate and toggle a selected stream |
-| `E`, `S`, `X` | Select all audio, all subtitles, or clear a stream type |
-| `N`, `D` | Save or delete a custom preset |
-| `Q` | Quit; during conversion, optionally save a resume file before aborting |
-
-The **Batch** page is available after selecting a directory: arrow keys browse
-the discovered relative paths, `Enter` opens per-media settings, `R` resets the
-selected media to global defaults, and `G` resets every media to global defaults.
-While editing an item on **Settings**, `G` propagates the highlighted setting
-to the other discovered compatible media.
-
-In the input browser, press `D` to select the current folder for recursive
-batch conversion. Batch mode retains all compatible audio and subtitle tracks
-for each video because episode stream layouts can differ.
-
-Pause suspends the complete transcoder/FFmpeg process tree, so CPU/GPU work and
-output generation stop until `P` is pressed again. A paused conversion can be
-aborted safely with `A`.
-
-## Quality, HDR, and system load
-
-The default **Vita Perceptual Max** profile targets approximately 2.4 Mb/s at
-24 fps, 2.8 Mb/s at 30 fps, and 5.6 Mb/s at 60 fps. Use `--quality balanced`
-or `--quality compact` when smaller files matter more.
-
-### Content-specific tuning
-
-The compatibility contract does not change between presets: every output
-remains 960×544 H.264 High, `yuv420p`, source cadence up to 60 fps, and AAC-LC.
-Only the encoder's perceptual decisions and bitrate curve change.
-
-| Built-in preset | Use it for | x264 tuning | High-quality target at 24 / 30 / 60 fps |
-| --- | --- | --- | --- |
-| **Vita Movie Max** | Live action, digital cinema, normal television | `film`, CRF 18 | 2.4 / 2.8 / 5.6 Mb/s |
-| **Vita Anime Max** | Clean digital anime, cartoons, flat colours and line art | `animation`, CRF 17.5 | 2.2 / 2.6 / 5.2 Mb/s |
-| **Vita Anime Grain** | Older scanned anime with intentional photographic grain | `grain`, CRF 18 | 2.8 / 3.2 / 6.0 Mb/s |
-
-Use **Anime Max** for most modern animation. Use **Anime Grain** only when the
-source visibly contains real grain that should remain; it is intentionally
-larger. Do not use the grain preset merely because an old source contains
-compression noise, as preserving that noise wastes bitrate. **Movie Max** is
-the normal live-action choice.
-
-These three presets select software x264 because `film`, `animation`, and
-`grain` are x264 content tunes. With VideoToolbox, NVENC, AMF, or VAAPI,
-`--content-tune` still selects the corresponding safe bitrate curve, while the
-hardware encoder continues using its native high-quality mode. Keep **Vita
-Perceptual Max** for the fastest automatic hardware-first conversion.
-
-Long conversions default to `--system-load balanced`: two CPU cores remain
-available, heavy filters are capped, and macOS uses Utility QoS. Use
-`--system-load low` for a lighter desktop impact, or `--system-load full` when
-the computer is dedicated to conversion.
-
-HDR sources are tone-mapped to 8-bit BT.709 SDR before H.264 encoding. The
-tool stops if the required filters are missing rather than creating a visibly
-incorrect file. Use `--force-hdr` for untagged HDR content.
-
-## Tracks and covers
-
-All audio and subtitle tracks are selected by default. In the TUI, select the
-tracks on the **Streams** page; the CLI also accepts repeatable zero-based
-`--audio-track` and `--subtitle-track` options. `--no-audio` and
-`--no-subtitles` omit an entire stream type.
-
-Cover priority is: `--cover-image`, embedded input artwork, then an extracted
-SDR video frame. Disable it with `--no-cover`.
-
-The converter encodes video and audio separately, repairs timestamps, aligns
-audio to the final video duration, then remuxes the selected streams. It
-validates the AAC-LC profile, mono/stereo channel count, 48 kHz sample rate,
-duration, and stream contracts before publishing the output.
-
-The video-output audio contract is AAC-LC regardless of whether the source is
-AAC, MP3, FLAC, AC-3, DTS, or another format FFmpeg can decode. This is
-intentional: direct music-file support in VitaMediaDeck is separate from the
-H.264/AAC movie playback contract.
-
-The requested audio bitrate is a ceiling, not an upsampling control. A 192 kb/s
-source track therefore produces AAC at no more than 192 kb/s. If a container
-omits the stream bitrate, the tool measures the audio packet sizes before
-conversion instead of trusting the container's overall bitrate. Similarly, the
-source frame rate is preserved (and capped at 60 fps): a 23.976 fps film is not
-turned into 60 fps, which would add duplicate/interpolated frames without
-improving source detail.
-
-## Related repositories
-
-| Repository | Purpose |
-| --- | --- |
-| [`VitaMediaDeck`](https://github.com/spyro-98/VitaMediaDeck) | PS Vita media browser and player |
-| [`vita-hw-decoder`](https://github.com/spyro-98/vita-hw-decoder) | Hardware H.264/AAC playback backend |
-| [`vita-sw-decoder`](https://github.com/spyro-98/vita-sw-decoder) | CPU playback fallback |
-| [`vita-https`](https://github.com/spyro-98/vita-https) | HTTPS and seekable remote transport |
-
-Run `python3 vitamediadeck_transcoder.py --help` for every CLI option.
+- [VitaMediaDeck](https://github.com/spyro-98/VitaMediaDeck): PS Vita media browser/player.
+- [vita-hw-decoder](https://github.com/spyro-98/vita-hw-decoder): hardware playback backend.
+- [vita-sw-decoder](https://github.com/spyro-98/vita-sw-decoder): software playback backend.
+- [vita-https](https://github.com/spyro-98/vita-https): HTTPS and seekable remote transport.
