@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import textwrap
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -33,19 +34,25 @@ except ImportError as exc:  # pragma: no cover - exercised on Windows without wi
     ) from exc
 
 import vitamediadeck_transcoder as core
+import vmd_workflow as workflow
+import vmd_preview as preview
+import vmd_ui as ui
+import vmd_audio_preview as audio_preview
+import vmd_av_preview as av_preview
+import vmd_progress as video_progress
 
 
 TABS = ("Overview", "Streams", "Settings", "Presets", "Batch", "Log")
 KEY_BACK_TAB = getattr(curses, "KEY_BTAB", 353)
 VIDEO_EXTENSIONS = core.VIDEO_EXTENSIONS
 PHASE_RANGES: dict[str, tuple[float, float, str]] = {
-    "analysis": (0.00, 0.02, "ANALYZING INPUT"),
-    "preflight": (0.02, 0.05, "TESTING ENCODER"),
-    "transcode": (0.05, 0.90, "CONVERTING MEDIA"),
-    "media_validation": (0.90, 0.92, "CHECKING MEDIA"),
-    "cover": (0.92, 0.95, "PREPARING COVER"),
-    "package": (0.95, 0.98, "FINALIZING FILE"),
-    "final_validation": (0.98, 1.00, "VERIFYING OUTPUT"),
+    "analysis": (0.00, 0.00, "ANALYZING INPUT"),
+    "preflight": (0.00, 0.00, "TESTING ENCODER"),
+    "transcode": (0.00, 1.00, "ENCODING VIDEO"),
+    "media_validation": (1.00, 1.00, "CHECKING MEDIA"),
+    "cover": (1.00, 1.00, "PREPARING COVER"),
+    "package": (1.00, 1.00, "FINALIZING FILE"),
+    "final_validation": (1.00, 1.00, "VERIFYING OUTPUT"),
     "complete": (1.00, 1.00, "COMPLETE"),
 }
 PHASE_ORDER = (
@@ -71,11 +78,11 @@ PHASE_SHORT = {
 @dataclass
 class Settings:
     encoder: str = "auto"
-    quality: str = "high"
+    quality: str = "maximum"
     content_tune: str = "movie"
     max_fps: str = "60"
-    audio_bitrate: int = 192
-    system_load: str = "balanced"
+    audio_bitrate: int = core.AAC_OUTPUT_MAX_KBPS
+    system_load: str = "full"
     tone_map: str = "mobius"
     force_hdr: bool = False
     hw_decode: bool = True
@@ -85,10 +92,20 @@ class Settings:
     vaapi_device: str = "/dev/dri/renderD128"
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
+    audio_tracks: list[int] | None = None
+    subtitle_tracks: list[int] | None = None
+    encode_speed: str = "slow"
+    denoise: str = "off"
+    sharpen: str = "off"
+    deband: str = "off"
+    scaler: str = "auto"
+    filter_backend: str = "auto"
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "Settings":
         allowed = {item.name for item in fields(cls)}
+        if 'filter_backend' not in payload:
+            payload = {**payload, 'filter_backend': 'cpu', 'scaler': payload.get('scaler', 'lanczos')}
         return cls(**{key: value for key, value in payload.items() if key in allowed})
 
     def command(
@@ -101,6 +118,10 @@ class Settings:
         resume_state: Path | None = None,
         batch_plan: Path | None = None,
     ) -> list[str]:
+        if audio_tracks is None:
+            audio_tracks = self.audio_tracks
+        if subtitle_tracks is None:
+            subtitle_tracks = self.subtitle_tracks
         command = [
             sys.executable,
             "-u",
@@ -128,6 +149,7 @@ class Settings:
             "--ffprobe",
             self.ffprobe,
         ]
+        command.extend(core.video_option_arguments(self))
         if self.force_hdr:
             command.append("--force-hdr")
         if not self.hw_decode:
@@ -175,20 +197,40 @@ class LiveProgress:
     bitrate: str = "-"
     speed: str = "-"
     media_seconds: float = 0.0
+    video_fps: float = 0.0
+    video_finished: bool = False
     media_duration: float | None = None
     eta_seconds: float | None = None
     started_at: float = 0.0
 
 
 BUILTIN_PRESETS: dict[str, Settings] = {
-    "Vita Perceptual Max": Settings(),
+    "Vita HW - Max perceptual": Settings(quality="maximum"),
+    "Vita HW - Medium": Settings(quality="balanced", audio_bitrate=160),
+    "Vita HW - Light": Settings(quality="compact", max_fps="30", audio_bitrate=128),
+    "Vita SW - Max perceptual": Settings(encoder="x264", content_tune="vita-sw", max_fps="30", quality="maximum"),
+    "Vita SW - Medium": Settings(encoder="x264", content_tune="vita-sw", max_fps="30", quality="balanced", audio_bitrate=160),
+    "Vita SW - Light": Settings(encoder="x264", content_tune="vita-sw", max_fps="30", quality="compact", audio_bitrate=128),
     "Vita Movie Max": Settings(encoder="x264", content_tune="movie"),
     "Vita Anime Max": Settings(encoder="x264", content_tune="anime"),
     "Vita Anime Grain": Settings(encoder="x264", content_tune="anime-grain"),
     "Balanced": Settings(quality="balanced"),
     "Compact 30 fps": Settings(quality="compact", max_fps="30", audio_bitrate=160),
-    "Software Compatibility": Settings(encoder="x264", hw_decode=False),
+    "Computer CPU Compatibility": Settings(encoder="x264", hw_decode=False),
     "HDR Highlight Detail": Settings(tone_map="hable"),
+    "Mac Fast Hardware": Settings(encoder="videotoolbox", quality="balanced"),
+    "CPU Maximum Detail": Settings(encoder="x264", quality="maximum", encode_speed="veryslow"),
+    "Film Preserve Grain": Settings(encoder="x264", content_tune="film-grain", quality="maximum"),
+    "Noisy Film Gentle Clean": Settings(denoise="light", quality="high"),
+    "Noisy Source Compact": Settings(denoise="medium", quality="compact", max_fps="30", audio_bitrate=160),
+    "Animation Smooth Gradients": Settings(content_tune="anime", deband="light", sharpen="light"),
+    "Soft Source Gentle Sharpen": Settings(sharpen="light", scaler="spline"),
+    "Mac GPU Gentle Clean": Settings(encoder="videotoolbox", filter_backend="apple-gpu", denoise="light", sharpen="light"),
+}
+
+LEGACY_PRESETS = {
+    "vita perceptual max": Settings(quality="high", audio_bitrate=192, system_load="balanced"),
+    "software compatibility": Settings(encoder="x264", hw_decode=False, quality="high", audio_bitrate=192, system_load="balanced"),
 }
 
 
@@ -293,23 +335,29 @@ def tag_text(stream: dict[str, Any]) -> str:
 class TerminalApp:
     SETTING_ROWS = (
         ("Encoder", "encoder", ("auto", "videotoolbox", "nvenc", "amf", "vaapi", "x264")),
-        ("Quality", "quality", ("high", "balanced", "compact")),
+        ("Quality", "quality", ("compact", "balanced", "high", "maximum")),
         ("Content tuning", "content_tune", core.CONTENT_TUNES),
-        ("Maximum FPS", "max_fps", ("60", "60000/1001", "50", "30", "30000/1001", "25", "24", "24000/1001")),
-        ("Audio bitrate", "audio_bitrate", (128, 160, 192, 256, 320)),
+        ("Maximum FPS", "max_fps", ("12", "15", "20", "24000/1001", "24", "25", "30000/1001", "30", "50", "60000/1001", "60")),
+        ("Audio bitrate", "audio_bitrate", core.AUDIO_BITRATE_STEPS),
         ("System load", "system_load", ("low", "balanced", "full")),
         ("Tone map", "tone_map", ("mobius", "hable", "reinhard")),
         ("Force HDR", "force_hdr", (False, True)),
-        ("Hardware decode", "hw_decode", (True, False)),
-        ("Cover", "cover_mode", ("auto", "custom", "none")),
+        ("Hardware decode", "hw_decode", (False, True)),
+        ("Cover", "cover_mode", ("none", "auto", "custom")),
         ("Cover image", "cover_image", None),
         ("Overwrite output", "overwrite", (False, True)),
         ("VAAPI device", "vaapi_device", None),
         ("FFmpeg", "ffmpeg", None),
         ("ffprobe", "ffprobe", None),
+        ("x264 compression effort", "encode_speed", core.VIDEO_OPTION_CHOICES['encode_speed']),
+        ("Noise reduction", "denoise", core.VIDEO_OPTION_CHOICES['denoise']),
+        ("Sharpening", "sharpen", core.VIDEO_OPTION_CHOICES['sharpen']),
+        ("Colour band reduction", "deband", core.VIDEO_OPTION_CHOICES['deband']),
+        ("Resize method", "scaler", core.VIDEO_OPTION_CHOICES['scaler']),
+        ("Filter processing", "filter_backend", core.VIDEO_OPTION_CHOICES['filter_backend']),
     )
     SETTING_HELP = {
-        "encoder": "Select the H.264 engine. AUTO probes hardware first and falls back safely.",
+        "encoder": "AUTO measures valid CPU/GPU pipelines. An explicit encoder stays fixed.",
         "quality": "Controls the target bitrate envelope: HIGH, BALANCED, or COMPACT.",
         "content_tune": "MOVIE uses x264 film; ANIME protects line art; ANIME-GRAIN preserves analog grain.",
         "max_fps": "Preserves source cadence up to this ceiling. Vita output never exceeds 60 fps.",
@@ -348,6 +396,8 @@ class TerminalApp:
                 if self.input_path.is_dir()
                 else core.default_output(self.input_path)
             )
+        if self.input_path and self.input_path.is_file() and self.output_path and not resume_state and self.output_path != self.input_path:
+            self.output_path = workflow.output_file(self.output_path).resolve()
         self.input_payload: dict[str, Any] | None = None
         self.output_payload: dict[str, Any] | None = None
         self.info: core.MediaInfo | None = None
@@ -357,6 +407,25 @@ class TerminalApp:
         self.batch_selection_index = 0
         self.batch_edit_source: Path | None = None
         self.batch_plan_path: Path | None = None
+        self.batch_enabled: dict[Path, bool] = {}
+        self.batch_metadata: dict[Path, dict[str, Any]] = {}
+        self.batch_weights = (0.0, 1.0, 1.0)
+        self.preview_backend = os.environ.get("VMD_DETECTED_PREVIEW", "unicode")
+        self.preview_samples: dict[Path, int | None] = {}
+        self.inline_request = None
+        self.inline_rendered = None
+        self.inline_surface = None
+        self.audio_preview = None
+        self.audio_segments = {}
+        self.audio_sample_indices = {}
+        self.audio_track_indices = {}
+        self.audio_signature = None
+        self.av_inline = None
+        self.av_inline_key = None
+        self.av_inline_started = 0
+        self.editor_primary = True
+        self.pause_started: float | None = None
+        self.active_entries: list[dict[str, Any]] | None = None
         if self.resume_state_path and self.input_path and self.input_path.is_dir():
             self.restore_batch_settings(self.resume_state_path)
         self.probe_error = ""
@@ -394,6 +463,7 @@ class TerminalApp:
                 continue
             source = Path(str(item.get("source") or "")).expanduser().resolve()
             self.batch_settings[source] = Settings.from_dict(item["settings"])
+            self.batch_enabled[source] = item.get("enabled", True)
 
     def active_settings(self) -> Settings:
         if self.batch_edit_source is None:
@@ -421,39 +491,9 @@ class TerminalApp:
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
-            if curses.COLORS >= 256:
-                void = 233
-                veil = 235
-                curses.init_pair(1, 45, void)     # ion cyan
-                curses.init_pair(2, 233, 214)     # amber selection plate
-                curses.init_pair(3, 195, void)    # particle white
-                curses.init_pair(4, 44, void)     # spectral teal telemetry
-                curses.init_pair(5, 203, void)    # fault coral
-                curses.init_pair(6, 233, 44)      # cyan command plate
-                curses.init_pair(7, 214, void)    # hologram amber
-                curses.init_pair(8, 66, void)     # cold spectral slate
-                curses.init_pair(9, 252, void)    # primary text
-                curses.init_pair(10, 159, veil)   # raised cryo surface
-                curses.init_pair(11, 208, void)   # retained energy orange
-                curses.init_pair(12, 30, void)    # abyssal teal structure
-                curses.init_pair(13, 159, void)   # frost cyan
-                curses.init_pair(14, 172, void)   # oxidized copper
-            else:
-                curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
-                curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-                curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_BLACK)
-                curses.init_pair(4, curses.COLOR_CYAN, curses.COLOR_BLACK)
-                curses.init_pair(5, curses.COLOR_RED, curses.COLOR_BLACK)
-                curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_CYAN)
-                curses.init_pair(7, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-                curses.init_pair(8, curses.COLOR_BLUE, curses.COLOR_BLACK)
-                curses.init_pair(9, curses.COLOR_WHITE, curses.COLOR_BLACK)
-                curses.init_pair(10, curses.COLOR_CYAN, curses.COLOR_BLACK)
-                curses.init_pair(11, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-                curses.init_pair(12, curses.COLOR_CYAN, curses.COLOR_BLACK)
-                curses.init_pair(13, curses.COLOR_CYAN, curses.COLOR_BLACK)
-                curses.init_pair(14, curses.COLOR_YELLOW, curses.COLOR_BLACK)
-            self.screen.bkgd(" ", 0)
+            import vmd_theme
+            vmd_theme.configure(curses)
+            self.screen.bkgd(" ", self.color(9))
 
     def color(self, pair: int) -> int:
         return curses.color_pair(pair) if curses.has_colors() else 0
@@ -667,12 +707,36 @@ class TerminalApp:
     def run(self) -> None:
         if self.input_path:
             self.probe_current()
-        while self.running:
-            self.drain_events()
-            self.draw()
-            key = self.screen.getch()
-            if key != -1:
-                self.handle_key(key)
+            recovery = workflow.find_recovery(self.output_path, self.input_path.is_dir()) if self.output_path else None
+            if not self.resume_state_path and recovery and recovery.is_file():
+                question = ('Legacy conversion found. Resume with its original saved paths?' if workflow.legacy_state(recovery)
+                            else 'Saved conversion found. Restore its queue and settings?')
+                if self.confirm(question):
+                    state = core.load_resume_state(recovery)
+                    self.resume_state_path = recovery
+                    self.output_path = Path(state['output_path']).expanduser().resolve()
+                    if state.get("settings"):
+                        self.settings = Settings.from_dict(state["settings"])
+                    self.restore_batch_settings(recovery)
+                    order = [Path(item["source"]) for item in state["entries"]]
+                    if self.input_path.is_dir():
+                        self.batch_sources = order
+            if self.resume_state_path and self.input_path.is_file():
+                entry = core.load_resume_state(self.resume_state_path)["entries"][0]
+                if "audio_tracks" in entry:
+                    self.selected_audio_tracks = set(entry["audio_tracks"])
+                if "subtitle_tracks" in entry:
+                    self.selected_subtitle_tracks = set(entry["subtitle_tracks"])
+            elif self.resume_state_path and self.input_path.is_dir():
+                self.batch_sources = [Path(item["source"]) for item in core.load_resume_state(self.resume_state_path)["entries"]]
+        try:
+            av_preview.run_view(self, primary=True)
+        finally:
+            if self.audio_preview:
+                self.audio_preview.close()
+            if self.av_inline:
+                self.av_inline.close()
+            self.delete_inline_image()
 
     def draw(self) -> None:
         self.screen.erase()
@@ -681,6 +745,10 @@ class TerminalApp:
         for row in range(height):
             self.fill(row, 0, width - 1, self.color(9))
         if height < 22 or width < 76:
+            if self.inline_rendered is not None:
+                self.delete_inline_image()
+                self.screen.clearok(True)
+            self.inline_surface = None
             self.add(0, 2, "△ VITA MEDIA DECK", self.color(13) | curses.A_BOLD)
             self.signal_carrier(1, 2, max(1, width - 5))
             self.add(3, 2, "TERMINAL TOO SMALL", self.color(5) | curses.A_BOLD)
@@ -707,20 +775,44 @@ class TerminalApp:
             style = self.color(2) | curses.A_BOLD if index == self.tab else self.color(12)
             self.add(4, cursor, label, style)
             cursor += len(label) + 2
+        self.add(5, 2, "V AV editor | [ ] Previous/next sample | < > Skip 10 | Tab Pages", self.color(4), width - 4)
         content_top = 6
         content_height = height - 11
         module_title = f"{self.tab + 1:02d} / {TABS[self.tab]}"
         self.box(content_top, 1, content_height, width - 2, module_title, 12)
+        editor_width = width - 6
+        editor_height = content_height - 2
+        self.inline_surface = None
+        embedded = self.tab in (1, 2, 3, 4) and self.input_path and editor_height >= 16
+        if embedded:
+            preferred_height = {
+                1: 14,
+                2: len(self.SETTING_ROWS) + 8,
+                3: max(9, len(self.presets.rows()) + 3),
+                4: max(9, min(16, len(self.batch_sources) + 6)),
+            }[self.tab]
+            # Parameter names, values and descriptions keep the full width.
+            # Reserve a separate, non-overlapping image area underneath.
+            reserved_preview_height = max(6, min(14, int(editor_height * .4 + .5)))
+            editor_height = min(preferred_height, max(9, editor_height - reserved_preview_height - 1))
+            preview_top = content_top + 1 + editor_height + 1
+            preview_height = content_height - 2 - editor_height - 1
+            self.draw_inline_preview(preview_top, 3, preview_height, editor_width)
+        elif self.inline_rendered is not None:
+            self.delete_inline_image()
+            self.screen.clearok(True)
+        if self.tab in (1, 2, 3, 4) and self.input_path and not embedded:
+            self.add(5, 2, "V Full preview | Increase window height for the preview below the menu", self.color(4), width - 4)
         if self.tab == 0:
             self.draw_overview(content_top + 1, 3, content_height - 2, width - 6)
         elif self.tab == 1:
-            self.draw_streams(content_top + 1, 3, content_height - 2, width - 6)
+            self.draw_streams(content_top + 1, 3, editor_height, editor_width)
         elif self.tab == 2:
-            self.draw_settings(content_top + 1, 3, content_height - 2, width - 6)
+            self.draw_settings(content_top + 1, 3, editor_height, editor_width)
         elif self.tab == 3:
-            self.draw_presets(content_top + 1, 3, content_height - 2, width - 6)
+            self.draw_presets(content_top + 1, 3, editor_height, editor_width)
         elif self.tab == 4:
-            self.draw_batch(content_top + 1, 3, content_height - 2, width - 6)
+            self.draw_batch(content_top + 1, 3, editor_height, editor_width)
         else:
             self.draw_log(content_top + 1, 3, content_height - 2, width - 6)
         status_style = self.color(5) if any(token in self.status.lower() for token in ("fail", "error", "could not")) else self.color(4)
@@ -728,13 +820,193 @@ class TerminalApp:
         self.add(height - 4, 11, self.status.upper(), status_style, width - 13)
         self.signal_carrier(height - 2, 1, width - 3)
         footer = (
-            " I INPUT  O OUTPUT  U UPDATE  T TRANSCODE  P PAUSE/RESUME  A ABORT  TAB VIEW  Q EXIT "
+            " I Input  O Output  U Update  V Preview  T Transcode  P Pause/Resume  A Abort  Tab Pages  Q Exit "
             if width >= 108
-            else " I IN  O OUT  U UPDATE  T RUN  P PAUSE  A STOP  TAB VIEW  Q EXIT "
+            else " I Input O Output U Update V Preview T Run P Pause A Abort Tab Pages Q Exit "
         )
         self.fill(height - 1, 0, width - 1, self.color(6))
         self.add(height - 1, 2, footer, self.color(6) | curses.A_BOLD, width - 4)
         self.screen.refresh()
+        self.paint_inline_image()
+
+    def preview_subject(self):
+        pinned = getattr(self, '_conversion_preview_subject', None)
+        if self.worker and self.worker.is_alive() and pinned:
+            return pinned
+        if not self.input_path:
+            return None, self.settings
+        if not self.input_path.is_dir():
+            return self.input_path, self.settings
+        if self.worker and self.worker.is_alive() and self.live.batch_source:
+            source = self.input_path / self.live.batch_source
+            return source, self.settings_for_batch_source(source)
+        if not self.batch_sources:
+            return None, self.settings
+        source = self.batch_sources[min(self.batch_selection_index, len(self.batch_sources) - 1)]
+        if self.tab in (2, 3) and self.batch_edit_source in self.batch_sources:
+            source = self.batch_edit_source
+        elif self.tab in (2, 3):
+            return source, self.settings
+        return source, self.settings_for_batch_source(source)
+
+    def delete_inline_image(self):
+        if self.preview_backend == "kitty":
+            sys.stdout.write("\x1b_Ga=d,d=I,i=31415,q=2\x1b\\")
+            sys.stdout.flush()
+        self.inline_rendered = None
+
+    def draw_inline_preview(self, top, left, height, width):
+        source, settings = self.preview_subject()
+        self.add(top, left, "Video preview · encoded frame", self.color(4), width)
+        if source is None:
+            self.add(top + 1, left, "Select a video first.", self.color(8), width)
+            return
+        index = self.preview_samples.get(source)
+        image_rows = max(1, height - 4)
+        rows = max(1, min(image_rows, int((width - 2) * 544 / 960 / 2 + .5)))
+        columns = max(4, min(width - 2, int(rows * 2 * 960 / 544 + .5)))
+        image_top = top + 2 + (image_rows - rows) // 2
+        image_left = left + (width - columns) // 2
+        pw = columns if self.preview_backend == "unicode" else min(1920, columns * 8)
+        ph = rows * 2 if self.preview_backend == "unicode" else max(2, pw * 544 // 960)
+        from types import SimpleNamespace
+        try:
+            if self.input_path.is_dir():
+                metadata = self.batch_metadata.get(source, {})
+                info = SimpleNamespace(audio_stream_count=metadata.get("audio_count", 0),
+                                       subtitle_codecs=[None] * metadata.get("subtitle_count", 0))
+            else:
+                info = self.info
+            audio, subtitles = av_preview.selection(self, settings, info) if info else ([], [])
+            stat = source.stat()
+            key = (source, stat.st_size, stat.st_mtime_ns, json.dumps(asdict(settings), sort_keys=True), index, tuple(audio), tuple(subtitles), pw, ph)
+            if key != self.av_inline_key:
+                if self.av_inline:
+                    self.av_inline.close(wait=False)
+                self.av_inline = av_preview.Clip(source, asdict(settings), index, audio, subtitles, pw, ph, self.preview_backend)
+                self.av_inline_key = key
+                self.av_inline_started = 0
+            clip = self.av_inline
+            error = clip.error
+            frame = None
+            if clip.ready():
+                position = clip.position()
+                number = min(len(clip.frames) - 1, int(position * clip.display_fps))
+                caption = " / ".join(av_preview.cue_at(lane.cues, position) for lane in clip.subtitle_lanes if lane.enabled)
+                frame = SimpleNamespace(timestamp=clip.start + position, encoder=clip.encoder,
+                                        payload=clip.frames[number], number=number, caption=caption)
+        except OSError as exc:
+            key, frame, error = None, None, str(exc)
+        surface_key = (key, self.tab, image_top, image_left, columns, rows)
+        if surface_key != self.inline_request:
+            self.delete_inline_image()
+            self.screen.clearok(True)
+            self.inline_request = surface_key
+        self.add(top, left, f"Converted clip · muted · V opens synchronized AV editor · {source.name}", self.color(4), width)
+        label = "Default · 20% of video" if index is None else f"Sample {index + 1}/100 · {index * 100 / 99:.1f}%"
+        if frame:
+            label += f" · {frame.timestamp:.2f}s · {frame.encoder} · {settings.quality}"
+            self.inline_surface = ((surface_key, frame.number), frame, image_top, image_left, columns, rows)
+            if frame.caption:
+                label += " | " + frame.caption
+        elif error:
+            for offset, line in enumerate(textwrap.wrap(error, max(1, width))[:image_rows]):
+                self.add(top + 2 + offset, left, line, self.color(5), width)
+        else:
+            self.add(top + 2, left, self.av_inline.state if self.av_inline else "Preparing AV clip...", self.color(8), width)
+        self.add(top + 1, left, label, self.color(4), width)
+        self.add(top + height - 2, left, "[ ] Video < > Skip 10 V Full | { } Audio J Track L Play/Stop", self.color(4), width)
+        audio = self.audio_context()
+        if audio:
+            _, _, ordinal, sample, (start, length), _ = audio
+            status = self.audio_preview.status if self.audio_preview else "L Listen to converted AAC"
+            self.add(top + height - 1, left, f"Audio {sample + 1}/10 · Track {ordinal + 1} · {start:.2f}s + {length:.2f}s | {status}", self.color(8), width)
+        else:
+            self.add(top + height - 1, left, "Audio preview needs audio and a known duration.", self.color(8), width)
+
+    def audio_context(self):
+        source, settings = self.preview_subject()
+        if source is None:
+            return None
+        if self.input_path and self.input_path.is_dir():
+            metadata = self.batch_metadata.get(source, {})
+            count, duration = metadata.get("audio_count", 0), metadata.get("duration")
+        else:
+            count = self.info.audio_stream_count if self.info else 0
+            duration = self.info.duration if self.info else None
+        if not count or not duration:
+            return None
+        ordinal = self.audio_track_indices.get(source, 0) % count
+        if self.tab == 1 and self.track_choices:
+            kind, highlighted = self.track_choices[self.track_selection_index]
+            if kind == "audio":
+                ordinal = highlighted
+        self.audio_track_indices[source] = ordinal
+        try:
+            stat = source.stat()
+            segments_key = (source, stat.st_size, stat.st_mtime_ns, duration)
+        except OSError:
+            return None
+        if segments_key not in self.audio_segments:
+            self.audio_segments[segments_key] = audio_preview.random_segments(duration)
+        sample = self.audio_sample_indices.get(source, 0)
+        segment = self.audio_segments[segments_key][sample]
+        signature = (source, stat.st_size, stat.st_mtime_ns, ordinal, sample, settings.audio_bitrate, settings.ffmpeg, settings.ffprobe)
+        if self.audio_signature != signature:
+            if self.audio_preview and self.audio_preview.active:
+                self.audio_preview.stop()
+            self.audio_signature = signature
+        return source, settings, ordinal, sample, segment, count
+
+    def handle_audio_key(self, key):
+        context = self.audio_context()
+        if context is None:
+            self.status = "Audio preview needs a selected audio track and known video duration."
+            return
+        source, settings, ordinal, sample, segment, count = context
+        if key in (ord("{"), ord("}")):
+            if self.audio_preview:
+                self.audio_preview.stop()
+            self.audio_sample_indices[source] = max(0, min(9, sample + (-1 if key == ord("{") else 1)))
+        elif key in (ord("j"), ord("J")):
+            if self.audio_preview:
+                self.audio_preview.stop()
+            self.audio_track_indices[source] = (ordinal + 1) % count
+            if self.tab == 1:
+                self.track_selection_index = self.track_choices.index(("audio", self.audio_track_indices[source]))
+        else:
+            if self.audio_preview is None:
+                self.audio_preview = audio_preview.AudioPreview()
+            if self.audio_preview.active:
+                self.audio_preview.stop()
+            else:
+                self.audio_preview.play(source, asdict(settings), ordinal, segment)
+            self.status = self.audio_preview.status
+
+    def paint_inline_image(self):
+        if self.inline_surface is None:
+            return
+        key, frame, top, left, columns, rows = self.inline_surface
+        if key == self.inline_rendered:
+            return
+        if hasattr(frame, "payload"):
+            if self.preview_backend in ("kitty", "iterm2"):
+                payload = getattr(preview, self.preview_backend)(frame.payload, columns, rows)
+            else:
+                payload = frame.payload
+        elif self.preview_backend in ("kitty", "iterm2"):
+            payload = getattr(preview, self.preview_backend)(frame.png, columns, rows)
+        else:
+            payload = getattr(preview, self.preview_backend)(frame.rgb, frame.width, frame.height)
+        sys.stdout.write("\x1b7")
+        if self.preview_backend == "unicode":
+            for row, line in enumerate(payload.split("\r\n")):
+                sys.stdout.write(f"\x1b[{top + row + 1};{left + 1}H" + line)
+        else:
+            sys.stdout.write(f"\x1b[{top + 1};{left + 1}H" + payload)
+        sys.stdout.write("\x1b8")
+        sys.stdout.flush()
+        self.inline_rendered = key
 
     def draw_overview(self, top: int, left: int, height: int, width: int) -> None:
         if width >= 72 and height >= 11:
@@ -1217,8 +1489,8 @@ class TerminalApp:
     def stream_lines(self) -> list[tuple[str, int]]:
         if self.input_path and self.input_path.is_dir():
             return [
-                ("Batch conversion uses every compatible audio and subtitle track.", self.color(8)),
-                ("Per-file track selection is unavailable because episodes can differ.", curses.A_DIM),
+                ("Batch defaults preserve all compatible audio and subtitles.", self.color(8)),
+                ("V opens the AV editor to inspect/exclude tracks for the selected media.", curses.A_DIM),
             ]
         if not self.input_payload:
             return [("Inspect an input file to view every stream.", curses.A_DIM)]
@@ -1343,11 +1615,19 @@ class TerminalApp:
         self.add(
             top + 2,
             left,
-            "UP/DOWN SELECT  ·  LEFT/RIGHT MODIFY  ·  ENTER DIRECT INPUT  ·  G APPLY FIELD TO ALL",
+            "UP/DOWN SELECT  ·  LEFT/RIGHT MODIFY  ·  G APPLY FIELD TO ALL  ·  B GLOBAL DEFAULTS",
             self.color(8),
             width,
         )
-        list_height = max(1, height - 6)
+        list_height = max(1, height - 8)
+        label_width = min(23, max(16, width // 4))
+        longest_value = max(len(str(getattr(settings, attribute))) + 4 for _, attribute, _ in self.SETTING_ROWS)
+        value_width = max(12, min(max(24, longest_value), width - label_width - 32))
+        description_left = left + label_width + value_width + 4
+        description_width = max(1, width - label_width - value_width - 4)
+        self.add(top + 3, left, "Parameter", self.color(8), label_width)
+        self.add(top + 3, left + label_width + 2, "Value", self.color(8), value_width)
+        self.add(top + 3, description_left, "Effect of this value", self.color(8), description_width)
         offset = min(
             max(0, self.setting_index - list_height + 1),
             max(0, len(self.SETTING_ROWS) - list_height),
@@ -1359,17 +1639,25 @@ class TerminalApp:
             value = getattr(settings, attribute)
             if isinstance(value, bool):
                 value = "ENABLED" if value else "DISABLED"
+            elif attribute == 'max_fps':
+                value = ui.fps_label(value)
             if attribute == "cover_image" and settings.cover_mode != "custom":
                 value = "NOT USED"
                 style = self.color(8) if not selected else style
             marker = "◇" if selected else "·"
             value_text = f"‹ {value} ›" if choices is not None and selected else str(value)
-            row = f"{marker} P{index + 1:02d}  {label.upper():<20}  {value_text}"
-            self.add(top + 4 + visible, left, row, style, width)
+            row = top + 4 + visible
+            self.add(row, left, f"{marker} {label}", style, label_width)
+            self.add(row, left + label_width + 2, value_text, style, value_width)
+            self.add(row, description_left, ui.setting_description(settings, attribute), self.color(4) if selected else self.color(8), description_width)
         _, attribute, _ = self.SETTING_ROWS[self.setting_index]
         if height >= 8:
-            help_text = self.SETTING_HELP.get(attribute, "")
-            self.add(top + height - 1, left, "◣ " + help_text, self.color(4), width)
+            detail = ui.setting_description(settings, attribute)
+            selected_value = str(getattr(settings, attribute))
+            if len(selected_value) > value_width:
+                detail = f"{selected_value} — {detail}"
+            for row, line in enumerate(textwrap.wrap(detail, max(1, width - 2))[:3]):
+                self.add(top + height - 3 + row, left, line, self.color(4), width)
 
     def draw_presets(self, top: int, left: int, height: int, width: int) -> None:
         rows = self.presets.rows()
@@ -1408,7 +1696,7 @@ class TerminalApp:
         self.add(
             top + 2,
             left,
-            "UP/DOWN NAVIGATE  ·  ENTER EDIT THIS MEDIA  ·  R RESET TO GLOBAL  ·  G RESET ALL TO GLOBAL",
+            "SPACE INCLUDE  +/- REORDER  ENTER SETTINGS  V PREVIEW  F RETRY FAILED  R/G RESET",
             self.color(8),
             width,
         )
@@ -1416,7 +1704,7 @@ class TerminalApp:
             self.add(top + 4, left, "NO SUPPORTED VIDEO FOUND BELOW THIS DIRECTORY.", self.color(5), width)
             return
         self.batch_selection_index = min(self.batch_selection_index, len(self.batch_sources) - 1)
-        list_height = max(1, height - 4)
+        list_height = max(1, height - 6)
         offset = min(
             max(0, self.batch_selection_index - list_height + 1),
             max(0, len(self.batch_sources) - list_height),
@@ -1428,15 +1716,21 @@ class TerminalApp:
             setting = self.settings_for_batch_source(source)
             origin = "CUSTOM" if source in self.batch_settings else "GLOBAL"
             relative = source.relative_to(self.input_path)
-            summary = f"{setting.encoder}/{setting.quality}/{setting.max_fps}fps"
+            meta = self.batch_metadata.get(source, {})
+            state = meta.get("status", "pending") if self.batch_enabled.get(source, True) else "excluded"
+            summary = f"{state} {duration_text(meta.get('duration'))} {setting.encoder}/{setting.quality}/{ui.fps_label(setting.max_fps)}"
             marker = "◇" if selected else "·"
             self.add(
                 top + 4 + row,
                 left,
-                f"{marker} {index + 1:03d}  {origin:<6}  {summary:<26}  {relative}",
+                f"{marker} {index + 1:03d} {relative}  [{origin} {summary}]",
                 style,
                 width,
             )
+        selected_source = self.batch_sources[self.batch_selection_index]
+        meta = self.batch_metadata.get(selected_source, {})
+        self.add(top + height - 2, left, f"PATH › {selected_source}", self.color(8), width)
+        self.add(top + height - 1, left, str(meta.get("error") or meta.get("log") or "V: filtered frame + conversion plan"), self.color(4), width)
 
     def draw_log(self, top: int, left: int, height: int, width: int) -> None:
         lines = list(self.logs)
@@ -1551,6 +1845,11 @@ class TerminalApp:
 
     def handle_key(self, key: int) -> None:
         if key in (ord("q"), ord("Q")):
+            if not (self.process and self.process.poll() is None):
+                if not self.confirm("Exit VitaMediaDeck Transcoder?", accept_label='EXIT', reject_label='STAY'):
+                    return
+            # Recheck after the modal: a worker may have launched FFmpeg while
+            # the user was reading the exit confirmation.
             if self.process and self.process.poll() is None:
                 save_resume = self.confirm("Save a resume file before aborting?")
                 if save_resume:
@@ -1560,9 +1859,17 @@ class TerminalApp:
                         self.status = f"Could not save resume file: {exc}"
                         return
                     self.logs.append(f"Resume file saved: {resume_path}")
-                if not self.confirm("Abort conversion and quit?"):
+                if not self.confirm("Abort conversion and quit?", accept_label='ABORT + EXIT', reject_label='STAY'):
                     return
                 self.cancel_conversion()
+                if self.worker:
+                    self.worker.join(timeout=5)
+                    if self.worker.is_alive():
+                        self.status = "Waiting for conversion to stop; checkpoint is saved."
+                        return
+            elif self.worker and self.worker.is_alive():
+                self.status = "Conversion is starting. Press Q again to save or abort once it starts."
+                return
             self.running = False
             return
         if key == 9:
@@ -1577,6 +1884,25 @@ class TerminalApp:
         if ord("1") <= key <= ord(str(len(TABS))):
             self.tab = key - ord("1")
             return
+        if key in (ord("v"), ord("V")):
+            self.show_preview()
+            return
+        if key in (ord("l"), ord("L"), ord("j"), ord("J"), ord("{"), ord("}")):
+            self.handle_audio_key(key)
+            return
+        if key in (ord("["), ord("]"), ord("<"), ord(">")):
+            source, _ = self.preview_subject()
+            if source:
+                current = self.preview_samples.get(source)
+                current = 20 if current is None else current
+                step = {ord("["): -1, ord("]"): 1, ord("<"): -10, ord(">"): 10}[key]
+                self.preview_samples[source] = max(0, min(99, current + step))
+                self.status = f"Preview sample {self.preview_samples[source] + 1}/100."
+            return
+        if self.worker and self.worker.is_alive() and key not in (ord("p"), ord("P"), ord("a"), ord("A")):
+            if self.tab in (1, 2, 3, 4) or key in (ord("i"), ord("I"), ord("o"), ord("O"), ord("u"), ord("U")):
+                self.status = "Queue and settings are frozen while converting. P pauses; A aborts."
+                return
         if key in (ord("i"), ord("I")):
             self.choose_input()
         elif key in (ord("o"), ord("O")):
@@ -1671,6 +1997,10 @@ class TerminalApp:
             self.scroll[name] = 0
 
     def handle_settings_key(self, key: int) -> None:
+        if key in (ord("b"), ord("B")):
+            self.batch_edit_source = None
+            self.status = "Editing global defaults; custom media keep their overrides."
+            return
         if key == curses.KEY_UP:
             self.setting_index = (self.setting_index - 1) % len(self.SETTING_ROWS)
             return
@@ -1684,12 +2014,37 @@ class TerminalApp:
                 self.status = "Select a media item from Batch before propagating a setting."
                 return
             value = getattr(settings, attribute)
+            applied = 0
             for source in self.batch_sources:
+                if attribute == "force_hdr" and value and not self.batch_metadata.get(source, {}).get("hdr"):
+                    continue
+                if attribute == "cover_image" and value and not Path(str(value)).expanduser().is_file():
+                    continue
                 target = self.batch_settings.setdefault(source, Settings.from_dict(asdict(self.settings)))
                 setattr(target, attribute, value)
-            self.status = f"Applied {attribute} to {len(self.batch_sources)} compatible batch media item(s)."
+                applied += 1
+            self.status = f"Applied {attribute}: {applied} item(s); skipped {len(self.batch_sources) - applied} incompatible/unknown item(s)."
             return
         if choices is not None and key in (curses.KEY_LEFT, curses.KEY_RIGHT, 10, 13, ord(" ")):
+            if attribute == 'audio_bitrate':
+                plan = getattr(self, '_av_plan', {})
+                sources = plan.get('tracks') or plan.get('all_audio', [])
+                source_rates = [track.get('source_bps') for track in sources]
+                values = core.audio_bitrate_choices(source_rates)
+                current = settings.audio_bitrate
+                if key == curses.KEY_LEFT:
+                    settings.audio_bitrate = next((value for value in reversed(values) if value < current), current)
+                else:
+                    settings.audio_bitrate = next((value for value in values if value > current), current)
+                self.status = f'Audio target {settings.audio_bitrate} kb/s per stereo track; source/codec limit {values[-1]} kb/s.'
+                return
+            if attribute == 'max_fps':
+                current = core.fraction_from_text(settings.max_fps)
+                candidates = list(reversed(choices)) if key == curses.KEY_LEFT else list(choices)
+                settings.max_fps = next((value for value in candidates if current is None or
+                    (core.fraction_from_text(value) < current if key == curses.KEY_LEFT else core.fraction_from_text(value) > current)), settings.max_fps)
+                self.status = f'FPS ceiling: {ui.fps_label(settings.max_fps)}.'
+                return
             values = list(choices)
             current = getattr(settings, attribute)
             try:
@@ -1697,8 +2052,8 @@ class TerminalApp:
             except ValueError:
                 index = 0
             direction = -1 if key == curses.KEY_LEFT else 1
-            setattr(settings, attribute, values[(index + direction) % len(values)])
-            self.status = f"Changed {attribute}. Inspect again to refresh the output estimate."
+            setattr(settings, attribute, values[max(0, min(len(values) - 1, index + direction))])
+            self.status = f"Changed {attribute}. Preview updates automatically; 7 opens output review."
         elif choices is None and key in (10, 13):
             if attribute == "cover_image" and settings.cover_mode != "custom":
                 self.status = "Set Cover to custom first."
@@ -1759,7 +2114,21 @@ class TerminalApp:
             self.batch_selection_index = len(self.batch_sources) - 1
             return
         source = self.batch_sources[self.batch_selection_index]
-        if key in (10, 13):
+        if key == ord(" "):
+            self.batch_enabled[source] = not self.batch_enabled.get(source, True)
+        elif key in (ord("+"), ord("-")):
+            target = max(0, min(len(self.batch_sources) - 1, self.batch_selection_index + (1 if key == ord("+") else -1)))
+            self.batch_sources[self.batch_selection_index], self.batch_sources[target] = self.batch_sources[target], source
+            self.batch_selection_index = target
+        elif key in (ord("f"), ord("F")):
+            recovery = workflow.find_recovery(self.output_path, True) if self.output_path else None
+            if recovery and recovery.is_file():
+                state = core.load_resume_state(recovery)
+                failed = {Path(item["source"]) for item in state["entries"] if item.get("status") in {"failed", "interrupted", "running", "pending"}}
+                self.batch_enabled = {item: item in failed for item in self.batch_sources}
+                self.resume_state_path = recovery
+                self.status = f"Retry queue: {len(failed)} unfinished/failed item(s). Press T."
+        elif key in (10, 13):
             self.batch_edit_source = source
             self.tab = 2
             self.status = f"Editing settings for {source.relative_to(self.input_path)}. Press G to propagate a field."
@@ -1778,12 +2147,17 @@ class TerminalApp:
         chosen = self.file_browser(start)
         if chosen is None:
             return
+        if self.audio_preview:
+            self.audio_preview.stop()
         self.input_path = chosen.resolve()
         self.resume_state_path = None
         self.batch_settings.clear()
         self.batch_edit_source = None
         self.batch_selection_index = 0
         self.batch_plan_path = None
+        self.active_entries = None
+        self.batch_enabled.clear()
+        self.batch_metadata.clear()
         self.output_path = (
             core.default_batch_output(self.input_path)
             if self.input_path.is_dir()
@@ -1796,44 +2170,78 @@ class TerminalApp:
         self.probe_current()
 
     def planned_resume_entries(self) -> list[dict[str, Any]]:
+        if self.worker and self.worker.is_alive() and self.active_entries is not None:
+            return self.active_entries
         if not self.input_path or not self.output_path:
             raise ValueError("Select an input and output before saving a resume file.")
         if self.input_path.is_dir():
             sources = self.batch_sources or core.batch_video_sources(self.input_path)
             if not sources:
                 raise ValueError("No supported videos are available for batch resume.")
+            saved_targets = ({Path(item['source']): item['output'] for item in workflow.read_json(self.resume_state_path)['entries']}
+                             if workflow.legacy_state(self.resume_state_path) else {})
             return [
                 {
                     "source": str(source),
-                    "output": str(core.batch_output_path(self.input_path, self.output_path, source)),
+                    "output": saved_targets.get(source, str(core.batch_output_path(self.input_path, self.output_path, source))),
                     "settings": asdict(self.settings_for_batch_source(source)),
+                    "enabled": self.batch_enabled.get(source, True),
+                    "fingerprint": workflow.fingerprint(source),
                 }
                 for source in sources
             ]
         if not self.input_path.is_file():
             raise ValueError("The selected input file no longer exists.")
-        return [{"source": str(self.input_path), "output": str(self.output_path)}]
+        return [{"source": str(self.input_path), "output": str(self.output_path),
+                 "fingerprint": workflow.fingerprint(self.input_path),
+                 "audio_tracks": sorted(self.selected_audio_tracks),
+                 "subtitle_tracks": sorted(self.selected_subtitle_tracks)}]
+
+    def recovery_path(self) -> Path | None:
+        if not self.output_path or not self.input_path:
+            return None
+        if workflow.legacy_state(self.resume_state_path):
+            return self.resume_state_path
+        return workflow.recovery_path(self.output_path, self.input_path.is_dir())
+
+    def show_preview(self) -> None:
+        if self.av_inline:
+            self.av_inline.close(wait=False)
+            self.av_inline = None
+            self.av_inline_key = None
+        av_preview.run_view(self)
 
     def save_resume_state(self) -> Path:
         if not self.input_path or not self.output_path:
             raise ValueError("Select an input and output before saving a resume file.")
-        resume_path = self.resume_state_path
-        if resume_path is None:
-            stamp = time.strftime("%Y%m%d-%H%M%S")
-            resume_path = config_directory() / "resumes" / f"vitamediadeck-{stamp}.resume.json"
+        resume_path = self.recovery_path()
+        assert resume_path is not None
+        entries = self.planned_resume_entries()
+        # Retain the identity of an old output while saving an active/resumed
+        # replacement. Otherwise recovery could mistake it for the new result.
+        active = bool(self.worker and self.worker.is_alive())
+        existing_state = (resume_path if active and resume_path.is_file() else self.resume_state_path)
+        if existing_state and existing_state.is_file() and (self.resume_state_path or active):
+            saved = workflow.read_json(existing_state)
+            if saved.get("input_path") == str(self.input_path) and saved.get("output_path") == str(self.output_path):
+                old_entries = {item["source"]: item for item in saved.get("entries", [])}
+                for entry in entries:
+                    old = old_entries.get(entry["source"], {})
+                    if old.get("fingerprint") == entry.get("fingerprint") and "previous_output" in old:
+                        entry["previous_output"] = old["previous_output"]
         payload = {
             "version": core.RESUME_STATE_VERSION,
+            "application": "VitaMediaDeck Transcoder",
+            "layout": 'legacy' if workflow.legacy_state(self.resume_state_path) else workflow.LAYOUT,
             "mode": "batch" if self.input_path.is_dir() else "file",
             "input_path": str(self.input_path),
             "output_path": str(self.output_path),
             "settings": asdict(self.settings),
-            "entries": self.planned_resume_entries(),
+            "entries": entries,
             "saved_at": int(time.time()),
         }
         resume_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = resume_path.with_suffix(resume_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temporary, resume_path)
+        workflow.atomic_json(resume_path, payload)
         try:
             resume_path.chmod(0o600)
         except OSError:
@@ -1842,22 +2250,25 @@ class TerminalApp:
         self.resume_saved_path = self.resume_state_path
         return self.resume_state_path
 
-    def save_batch_plan(self) -> Path:
+    def save_batch_plan(self, replace_outputs: set[Path] | None = None) -> Path:
         if not self.input_path or not self.input_path.is_dir() or not self.output_path:
             raise ValueError("Select a directory and output folder before saving a batch plan.")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        plan_path = config_directory() / "batch-plans" / f"vitamediadeck-{stamp}.batch.json"
+        plan_path = workflow.support_directory(self.output_path, True) / "batch-plan.json"
+        entries = self.planned_resume_entries()
+        for entry in entries:
+            if Path(entry["output"]) in (replace_outputs or set()):
+                entry["settings"]["overwrite"] = True
         payload = {
             "version": core.RESUME_STATE_VERSION,
+            "application": "VitaMediaDeck Transcoder", "layout": workflow.LAYOUT,
             "mode": "batch",
+            "settings": asdict(self.settings),
             "input_path": str(self.input_path),
             "output_path": str(self.output_path),
-            "entries": self.planned_resume_entries(),
+            "entries": entries,
         }
         plan_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = plan_path.with_suffix(plan_path.suffix + ".tmp")
-        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temporary, plan_path)
+        workflow.atomic_json(plan_path, payload)
         try:
             plan_path.chmod(0o600)
         except OSError:
@@ -1873,7 +2284,8 @@ class TerminalApp:
             candidate = Path(value).expanduser()
             if not is_batch and candidate.suffix.lower() != ".mkv":
                 candidate = candidate.with_suffix(".mkv")
-            self.output_path = candidate.resolve()
+            candidate = candidate.resolve()
+            self.output_path = (candidate if is_batch or candidate == self.input_path else workflow.output_file(candidate).resolve())
             self.status = "Output folder updated." if is_batch else "Output path updated."
 
     def probe_current(self) -> None:
@@ -1888,7 +2300,20 @@ class TerminalApp:
             self.track_choices = []
             self.selected_audio_tracks.clear()
             self.selected_subtitle_tracks.clear()
-            self.batch_sources = core.batch_video_sources(self.input_path)
+            discovered = core.batch_video_sources(self.input_path)
+            self.batch_sources = [item for item in self.batch_sources if item in discovered] + [
+                item for item in discovered if item not in self.batch_sources
+            ]
+            try:
+                _, probe, _ = core.resolve_media_tools(self.settings.ffmpeg, self.settings.ffprobe)
+                for item in self.batch_sources:
+                    try:
+                        info = core.probe_media(probe, item, self.settings_for_batch_source(item).force_hdr)
+                        self.batch_metadata[item] = {"duration": info.duration, "hdr": info.hdr, "audio_count": info.audio_stream_count, "subtitle_count": len(info.subtitle_codecs), "status": "pending", "_media_info": info}
+                    except (core.TranscodeError, OSError, ValueError) as exc:
+                        self.batch_metadata[item] = {"duration": None, "status": "invalid", "error": str(exc)}
+            except core.TranscodeError as exc:
+                self.status = str(exc)
             self.batch_settings = {
                 source: settings
                 for source, settings in self.batch_settings.items()
@@ -1911,7 +2336,11 @@ class TerminalApp:
                 )
             return
         self.status = "Inspecting media and FFmpeg capabilities..."
-        self.draw()
+        if self.editor_primary:
+            self.add(1, 2, self.status, self.color(4))
+            self.screen.refresh()
+        else:
+            self.draw()
         try:
             ffmpeg, ffprobe, tool_origin = core.resolve_media_tools(
                 self.settings.ffmpeg,
@@ -1959,23 +2388,32 @@ class TerminalApp:
             self.probe_error = ""
             self.status = (
                 f"Inspection complete with {tool_origin}. "
-                "Review Overview, Streams, and Settings."
+                "Review Info, Video, Audio and Subtitles."
             )
         except (core.TranscodeError, OSError, json.JSONDecodeError) as exc:
             self.info = None
             self.input_payload = None
             self.capabilities = None
             self.probe_error = str(exc).replace("\n", " ")
-            self.status = "Inspection failed. See Overview."
+            self.status = "Inspection failed. See Info."
 
     def start_conversion(self) -> None:
-        if self.process and self.process.poll() is None:
+        if self.worker and self.worker.is_alive() or self.process and self.process.poll() is None:
             self.status = "A conversion is already running."
             return
+        # A finished worker may have queued its final event after the last UI
+        # refresh. Consume it before resetting the next conversion to zero.
+        self.drain_events()
         if not self.input_path or not (self.input_path.is_file() or self.input_path.is_dir()) or not self.output_path:
             self.status = "Select and inspect an input video or folder first."
             return
         is_batch = self.input_path.is_dir()
+        if not is_batch and not workflow.legacy_state(self.resume_state_path) and self.output_path.parent in self.input_path.parents:
+            self.status = 'Choose a conversion folder outside the original file’s folder.'
+            return
+        if is_batch and not any(self.batch_enabled.get(item, True) for item in self.batch_sources):
+            self.status = "Enable at least one item with Enter in Queue."
+            return
         if is_batch and not self.batch_sources:
             self.status = "No videos found in the selected folder."
             return
@@ -1990,11 +2428,36 @@ class TerminalApp:
             and not Path(setting.cover_image).expanduser().is_file()
             for setting in settings_to_check
         ):
-            self.status = "Select a valid custom cover image in Settings."
+            self.status = "Select a valid custom cover image in General."
             return
         try:
-            batch_plan = self.save_batch_plan() if is_batch and not self.resume_state_path else None
-        except (OSError, ValueError) as exc:
+            entries = self.planned_resume_entries()
+            if any(Path(entry["source"]).resolve() == Path(entry["output"]).resolve()
+                   for entry in entries if entry.get("enabled", True)):
+                self.status = "Input and output paths must be different."
+                return
+            conflicts = {Path(entry["output"]) for entry in entries
+                         if entry.get("enabled", True) and Path(entry["output"]).exists()
+                         and not entry.get("settings", asdict(self.settings)).get("overwrite", False)}
+            replace_outputs: set[Path] = set()
+            if conflicts and not self.resume_state_path:
+                first = sorted(conflicts)[0].name
+                if not self.confirm(f"Replace {len(conflicts)} existing output file(s), including {first}? "
+                                    "Each old file is kept until its replacement passes validation."):
+                    self.status = "Conversion cancelled; existing outputs were kept."
+                    return
+                replace_outputs = conflicts
+            # Fresh TUI snapshot includes order, exclusions and per-file settings.
+            # Validate the original manifest before refreshing its fingerprint.
+            if self.resume_state_path:
+                core.resume_entries(self.resume_state_path, "batch" if is_batch else "file", self.input_path, self.output_path)
+                self.save_resume_state()
+            batch_plan = self.save_batch_plan(replace_outputs) if is_batch and not self.resume_state_path else None
+            if not is_batch and not self.resume_state_path:
+                previous = self.resume_state_path
+                self.save_resume_state()
+                self.resume_state_path = previous
+        except (OSError, ValueError, core.TranscodeError) as exc:
             self.status = f"Could not save per-media batch settings: {exc}"
             return
         command = (
@@ -2015,14 +2478,20 @@ class TerminalApp:
                 self.resume_state_path,
             )
         )
+        if not is_batch and replace_outputs and "--overwrite" not in command:
+            command.append("--overwrite")
         self.logs.clear()
         self.logs.append("$ " + core.command_text(command))
+        preview_source, preview_settings = self.preview_subject()
+        self._conversion_preview_subject = (preview_source, Settings.from_dict(asdict(preview_settings)))
         self.progress_seconds = None
         self.live = LiveProgress(started_at=time.monotonic())
+        self.batch_weights = (0.0, 1.0, 1.0)
         self.paused = False
         self.suspended_processes.clear()
-        self.tab = 4
+        self.tab = TABS.index("Log")
         self.status = "Starting conversion..."
+        self.active_entries = self.planned_resume_entries()
         self.worker = threading.Thread(target=self.conversion_worker, args=(command,), daemon=True)
         self.worker.start()
 
@@ -2033,7 +2502,17 @@ class TerminalApp:
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
         else:
             kwargs["start_new_session"] = True
+        session_log = None
         try:
+            if self.output_path:
+                log_path = (workflow.support_directory(self.output_path, True) / "session.log"
+                            if self.input_path and self.input_path.is_dir()
+                            else workflow.media_support_directory(self.output_path) / "transcode.log")
+                if workflow.legacy_state(self.resume_state_path):
+                    log_path = (workflow.legacy_directory(self.output_path, True) / 'session.log'
+                                if self.input_path and self.input_path.is_dir() else workflow.legacy_directory(self.output_path) / 'transcode.log')
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                session_log = log_path.open("w", encoding="utf-8")
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,
@@ -2052,6 +2531,9 @@ class TerminalApp:
                 chunk = process.stdout.read(512)
                 if not chunk:
                     break
+                if session_log:
+                    session_log.write(chunk)
+                    session_log.flush()
                 buffer += chunk
                 parts = re.split(r"[\r\n]", buffer)
                 buffer = parts.pop()
@@ -2060,9 +2542,13 @@ class TerminalApp:
                         self.events.put(("line", line.rstrip()))
             if buffer.strip():
                 self.events.put(("line", buffer.rstrip()))
-            self.events.put(("done", process.wait()))
+            code = process.wait()
+            self.events.put(("done", code))
         except OSError as exc:
             self.events.put(("failure", str(exc)))
+        finally:
+            if session_log:
+                session_log.close()
 
     def drain_events(self) -> None:
         while True:
@@ -2092,6 +2578,10 @@ class TerminalApp:
                 self.process = None
                 self.paused = False
                 self.suspended_processes.clear()
+                recovery = self.recovery_path()
+                if self.input_path and self.input_path.is_dir() and recovery and recovery.is_file():
+                    state = workflow.read_json(recovery)
+                    self.batch_metadata = {Path(item["source"]): {**self.batch_metadata.get(Path(item["source"]), {}), **item} for item in state["entries"]}
                 if value == 0:
                     self.live.phase = "complete"
                     self.live.phase_label = "COMPLETE"
@@ -2106,6 +2596,7 @@ class TerminalApp:
                     )
                     self.inspect_output()
                 else:
+                    self.live.phase = "error"
                     self.status = f"Conversion failed with exit status {value}. See Log."
             elif kind == "failure":
                 self.process = None
@@ -2115,137 +2606,120 @@ class TerminalApp:
                 self.status = f"Could not start conversion: {value}"
 
     def apply_batch_context(self, payload: dict[str, Any]) -> None:
-        """Start a new local meter when a recursive batch advances to an episode."""
+        """Reset the movie timeline and select duration weights before each item."""
         try:
-            index = int(payload.get("batch_index") or 0)
-            total = int(payload.get("batch_total") or 0)
+            index, total = int(payload.get("batch_index") or 0), int(payload.get("batch_total") or 0)
         except (TypeError, ValueError):
             return
         if not (1 <= index <= total):
             return
-        if index != self.live.batch_index or total != self.live.batch_total:
-            self.live.phase_ratio = 0.0
-            self.live.local_ratio = 0.0
-            self.live.media_seconds = 0.0
-            self.live.media_duration = None
-            self.live.eta_seconds = None
-            self.live.frame = "-"
-            self.live.fps = "-"
-            self.live.quality = "-"
-            self.live.size = "-"
-            self.live.bitrate = "-"
-            self.live.speed = "-"
-            self.live.overall_ratio = (index - 1) / total
-        self.live.batch_index = index
-        self.live.batch_total = total
+        new_item = index != self.live.batch_index or total != self.live.batch_total
+        weights = tuple(video_progress.finite_number(payload.get(key), fallback) for key, fallback in
+                        (("batch_completed_weight", index - 1), ("batch_weight", 1), ("batch_total_weight", total)))
+        self.batch_weights = weights
+        self.live.batch_index, self.live.batch_total = index, total
         self.live.batch_source = str(payload.get("batch_source") or "")
+        if new_item:
+            self.live.phase_ratio = self.live.local_ratio = self.live.media_seconds = 0.0
+            self.live.video_fps, self.live.video_finished = 0.0, False
+            self.live.media_duration = video_progress.finite_number(payload.get("batch_duration")) or None
+            self.live.eta_seconds = None
+            self.progress_seconds = None
+            self.live.frame = self.live.fps = self.live.quality = self.live.size = self.live.bitrate = self.live.speed = "-"
+            self.set_local_progress(0.0)
+            item = self.input_path / self.live.batch_source if self.input_path else None
+            sources = getattr(self, 'batch_sources', [])
+            if item in sources:
+                self.batch_selection_index = sources.index(item)
+                if self.batch_edit_source is not None:
+                    self.batch_edit_source = item
 
     def set_local_progress(self, ratio: float) -> None:
-        self.live.local_ratio = max(self.live.local_ratio, max(0.0, min(1.0, ratio)))
+        self.live.local_ratio = max(self.live.local_ratio, max(0.0, min(1.0, video_progress.finite_number(ratio))))
         if self.live.batch_total:
-            self.live.overall_ratio = min(
-                1.0,
-                (self.live.batch_index - 1 + self.live.local_ratio)
-                / self.live.batch_total,
-            )
+            completed, current, total = self.batch_weights
+            self.live.overall_ratio = min(1.0, (completed + current * self.live.local_ratio) / max(1.0, total))
         else:
             self.live.overall_ratio = self.live.local_ratio
 
     def handle_machine_progress(self, payload: dict[str, Any]) -> None:
         self.apply_batch_context(payload)
-        phase = str(payload.get("phase") or "unknown")
-        state = str(payload.get("state") or "start")
+        phase, state = str(payload.get("phase") or "unknown"), str(payload.get("state") or "start")
         detail = str(payload.get("detail") or "")
-        if phase == "error":
-            self.live.phase = phase
-            self.live.phase_label = "FAULT"
-            self.live.detail = detail
-            self.status = f"Conversion error: {detail}"
+        if phase == "queue":
+            if self.input_path and self.input_path.is_dir():
+                self.batch_metadata.setdefault(self.input_path / self.live.batch_source, {}).update(status=state, error=detail)
+            if state in {"done", "skipped"}:
+                self.set_local_progress(1.0)
+            elif state == "failed":
+                # This queue item has been attempted; do not light its unencoded frames.
+                completed, current, total = self.batch_weights
+                self.live.overall_ratio = min(1.0, (completed + current) / max(1.0, total))
+            self.status = f"{self.live.batch_source}: {state}. {detail}"
             return
-        if phase == "cancelled":
-            self.live.phase = phase
-            self.live.phase_label = "CANCELLED"
-            self.live.detail = detail
-            self.status = "Conversion cancelled."
-            return
-        start, end, label = PHASE_RANGES.get(
-            phase,
-            (self.live.local_ratio, self.live.local_ratio, phase.upper()),
-        )
         self.live.phase = phase
-        self.live.phase_label = label
+        self.live.phase_label = PHASE_RANGES.get(phase, (0, 0, phase.upper()))[2]
         self.live.detail = detail
-        if state == "start":
-            self.live.phase_ratio = 0.0
-            self.set_local_progress(start)
-        elif state in {"done", "skipped"}:
+        if phase in {"error", "cancelled"}:
+            self.live.phase_label = "FAILED" if phase == "error" else "CANCELLED"
+            self.status = f"{self.live.phase_label}: {detail}"
+            return
+        if self.input_path and self.input_path.is_dir() and self.live.batch_source:
+            self.batch_metadata.setdefault(self.input_path / self.live.batch_source, {})["status"] = "done" if phase == "complete" else "running"
+        if phase == "transcode" and state in {"video_start", "fallback"}:
+            self.live.local_ratio = self.live.phase_ratio = self.live.media_seconds = 0.0
+            self.live.video_finished = False
+            self.live.frame = "0"
+            self.live.video_fps = video_progress.finite_number(payload.get("video_fps"))
+            self.live.media_duration = video_progress.finite_number(payload.get("duration")) or self.live.media_duration
+            self.set_local_progress(0.0)
+        elif phase == "transcode" and state == "progress" and not self.live.video_finished:
+            self.live.media_duration = video_progress.finite_number(payload.get("duration")) or self.live.media_duration
+            self.live.video_fps = video_progress.finite_number(payload.get("video_fps")) or self.live.video_fps
+            if payload.get("frame") is not None and self.live.video_fps > 0:
+                self.live.frame = str(payload["frame"])
+                seconds, ratio = video_progress.encoded_position(payload["frame"], self.live.video_fps, self.live.media_duration)
+            else:
+                seconds = video_progress.finite_number(payload.get("media_seconds"))
+                ratio = video_progress.finite_number(payload.get("progress"))
+            self.live.media_seconds = max(self.live.media_seconds, seconds)
+            self.set_local_progress(ratio or 0.0)
+            self.live.phase_ratio = self.live.local_ratio
+        elif phase == "transcode" and state in {"video_done", "done"}:
+            self.live.video_finished = True
+            self.live.media_seconds = self.live.media_duration or self.live.media_seconds
             self.live.phase_ratio = 1.0
-            self.set_local_progress(end)
-        elif state == "fallback":
-            self.live.phase_ratio = max(self.live.phase_ratio, 0.25)
-            self.set_local_progress(start + (end - start) * self.live.phase_ratio)
-        elif state == "stage":
-            self.live.phase_ratio = max(self.live.phase_ratio, 0.88)
-            self.set_local_progress(start + (end - start) * self.live.phase_ratio)
-        elif state == "progress":
-            try:
-                phase_progress = float(payload.get("progress"))
-            except (TypeError, ValueError):
-                phase_progress = 0.0
-            self.live.phase_ratio = max(
-                self.live.phase_ratio,
-                max(0.0, min(1.0, phase_progress)),
-            )
-            self.set_local_progress(start + (end - start) * self.live.phase_ratio)
-            try:
-                self.live.media_seconds = float(payload.get("media_seconds"))
-                self.live.media_duration = float(payload.get("duration"))
-            except (TypeError, ValueError):
-                pass
+            self.set_local_progress(1.0)
+        elif phase == "transcode" and state == "stage":
+            self.live.phase_label = "ENCODING AUDIO" if "AUDIO PASS" in detail else "ASSEMBLING OUTPUT"
+        elif phase == "complete":
+            self.live.video_finished = True
+            self.live.phase_ratio = 1.0
+            self.set_local_progress(1.0)
+        # Analysis, loading, preflight and packaging do not advance video progress.
         self.status = self.progress_status()
 
     def update_ffmpeg_stats(self, line: str) -> None:
-        audio_pass = "AUDIO PASS" in self.live.detail
-        if self.live.phase not in {"transcode", "package"}:
+        if self.live.phase != "transcode" or self.live.video_finished or "AUDIO PASS" in self.live.detail or "FINAL REMUX" in self.live.detail:
             return
-        if "time=" not in line:
+        frames = video_progress.frame_count(line)
+        if frames is None:
             return
-        if not audio_pass and not re.search(r"(?:^|\s)frame=\s*\d+", line):
-            return
-        patterns = {
-            "frame": r"frame=\s*([^\s]+)",
-            "fps": r"fps=\s*([^\s]+)",
-            "quality": r"q=\s*([^\s]+)",
-            "size": r"size=\s*([^\s]+)",
-            "bitrate": r"bitrate=\s*([^\s]+)",
-            "speed": r"speed=\s*([^\s]+)",
-        }
-        for attribute, pattern in patterns.items():
+        for attribute, pattern in {"fps": r"fps=\s*([^\s]+)", "quality": r"q=\s*([^\s]+)",
+                "size": r"size=\s*([^\s]+)", "bitrate": r"bitrate=\s*([^\s]+)", "speed": r"speed=\s*([^\s]+)"}.items():
             match = re.search(pattern, line)
             if match:
                 setattr(self.live, attribute, match.group(1))
-        time_match = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
-        if not time_match:
-            return
-        media_seconds = (
-            int(time_match.group(1)) * 3600
-            + int(time_match.group(2)) * 60
-            + float(time_match.group(3))
-        )
-        self.progress_seconds = media_seconds
-        self.live.media_seconds = media_seconds
-        duration = self.live.media_duration or (self.info.duration if self.info else None)
-        if not duration:
-            return
-        ratio = max(0.0, min(1.0, media_seconds / duration))
-        self.live.phase_ratio = max(self.live.phase_ratio, ratio)
-        start, end, _ = PHASE_RANGES[self.live.phase]
-        self.set_local_progress(start + (end - start) * ratio)
-        try:
-            speed = float(self.live.speed.rstrip("x"))
-            self.live.eta_seconds = max(0.0, duration - media_seconds) / speed
-        except (TypeError, ValueError, ZeroDivisionError):
-            self.live.eta_seconds = None
+        self.live.frame = str(frames)
+        fps = self.live.video_fps or float(getattr(self.info, 'fps', 0) or 0)
+        duration = self.live.media_duration or getattr(self.info, 'duration', None)
+        seconds, ratio = video_progress.encoded_position(frames, fps, duration)
+        self.live.media_seconds = self.progress_seconds = max(self.live.media_seconds, seconds)
+        self.live.media_duration = duration
+        self.set_local_progress(ratio or 0.0)
+        self.live.phase_ratio = self.live.local_ratio
+        speed = video_progress.finite_number(self.live.speed.rstrip("x"))
+        self.live.eta_seconds = max(0.0, duration - seconds) / speed if duration and speed > 0 else None
         self.status = self.progress_status()
 
     def progress_status(self) -> str:
@@ -2260,6 +2734,13 @@ class TerminalApp:
                 f" · OVERALL {self.live.overall_ratio * 100:.1f}% · PRESS P TO RESUME"
             )
         detail = f" · {self.live.detail}" if self.live.detail else ""
+        if self.live.started_at and self.live.overall_ratio > 0.02 and not self.paused:
+            elapsed = time.monotonic() - self.live.started_at
+            if elapsed > 10:
+                estimate = elapsed * (1 - self.live.overall_ratio) / self.live.overall_ratio
+                detail += f" · EST. QUEUE ETA {duration_text(estimate)}"
+            else:
+                detail += " · ETA CALIBRATING"
         return (
             f"{self.live.phase_label}: {local_label} {self.live.local_ratio * 100:.1f}%"
             f" · OVERALL {self.live.overall_ratio * 100:.1f}%{detail}"
@@ -2346,6 +2827,7 @@ class TerminalApp:
             else:
                 os.killpg(process.pid, signal.SIGSTOP)
             self.paused = True
+            self.pause_started = time.monotonic()
             self.live.eta_seconds = None
             self.logs.append("Conversion paused by user.")
             self.status = "Conversion paused. Press P to resume or A to abort."
@@ -2372,6 +2854,9 @@ class TerminalApp:
             else:
                 os.killpg(process.pid, signal.SIGCONT)
             self.paused = False
+            if self.pause_started is not None:
+                self.live.started_at += time.monotonic() - self.pause_started
+                self.pause_started = None
             if update_status:
                 self.logs.append("Conversion resumed by user.")
                 self.status = f"Conversion resumed: {self.progress_status()}"
@@ -2425,14 +2910,19 @@ class TerminalApp:
                 value.insert(cursor, chr(key))
                 cursor += 1
 
-    def confirm(self, message: str) -> bool:
+    def confirm(self, message: str, *, accept_label='CONTINUE', reject_label='CANCEL') -> bool:
         height, width = self.screen.getmaxyx()
-        box_width = min(width - 6, max(44, len(message) + 6))
+        av_preview.clear_images(self)
+        self.screen.erase()
+        box_width = min(width - 6, max(44, min(100, len(message) + 6)))
+        lines = textwrap.wrap(message, max(1, box_width - 6))[:max(1, height - 8)]
         left = (width - box_width) // 2
-        top = max(2, height // 2 - 2)
-        self.box(top, left, 5, box_width, "CONFIRM", 5)
-        self.add(top + 2, left + 3, message.upper(), self.color(9) | curses.A_BOLD, box_width - 6)
-        self.add(top + 3, left + 3, "[Y] CONTINUE  ·  [N/ESC] CANCEL", self.color(8), box_width - 6)
+        box_height = len(lines) + 4
+        top = max(1, (height - box_height) // 2)
+        self.box(top, left, box_height, box_width, "CONFIRM", 5)
+        for row, line in enumerate(lines):
+            self.add(top + 1 + row, left + 3, line, self.color(9) | curses.A_BOLD, box_width - 6)
+        self.add(top + box_height - 2, left + 3, f"[Y] {accept_label}  ·  [N/ESC] {reject_label}", self.color(8), box_width - 6)
         self.screen.refresh()
         while True:
             key = self.screen.getch()
@@ -2528,6 +3018,7 @@ class TerminalApp:
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Terminal UI for VitaMediaDeck Transcoder")
+    parser.add_argument("--version", action="version", version=f"VitaMediaDeck Transcoder {core.APP_VERSION}")
     parser.add_argument("input", type=Path, nargs="?", help="optional input video or folder")
     parser.add_argument("output", type=Path, nargs="?", help="optional output .mkv path or folder")
     parser.add_argument("--preset", help="load a built-in or saved preset")
@@ -2542,7 +3033,7 @@ def selected_settings(args: argparse.Namespace, store: PresetStore) -> Settings:
     settings = Settings(ffmpeg=args.ffmpeg, ffprobe=args.ffprobe)
     if not args.preset:
         return settings
-    for name, _, preset in store.rows():
+    for name, _, preset in [*store.rows(), *((name, False, preset) for name, preset in LEGACY_PRESETS.items())]:
         if name.lower() == args.preset.lower():
             settings = Settings.from_dict(asdict(preset))
             settings.ffmpeg = args.ffmpeg
@@ -2556,11 +3047,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     store = PresetStore()
     if args.list_presets:
         for name, custom, _ in store.rows():
-            print(f"{name}\t{'custom' if custom else 'built-in'}")
+            print(f"{name}\t{'custom' if custom else 'built-in'}\t{ui.preset_hint(name)}")
         return 0
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("Error: the terminal UI requires an interactive terminal.", file=sys.stderr)
         return 2
+    os.environ["VMD_DETECTED_PREVIEW"] = preview.detect_backend()
+    preview.detect_cell_size()
     if args.resume_state:
         if args.input or args.output or args.preset:
             raise SystemExit("--resume-state cannot be combined with input, output, or --preset.")

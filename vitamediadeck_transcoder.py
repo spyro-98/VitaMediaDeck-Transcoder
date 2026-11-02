@@ -9,6 +9,7 @@ and ffprobe.
 from __future__ import annotations
 
 import argparse
+import vmd_workflow as workflow
 import json
 import math
 import os
@@ -25,8 +26,10 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Sequence
+import vmd_progress as video_progress
 
 
+APP_VERSION = "1.1.0-beta.1"
 OUTPUT_WIDTH = 960
 OUTPUT_HEIGHT = 544
 COVER_WIDTH = 480
@@ -35,6 +38,14 @@ VITA_AUDIO_CODEC = "aac"
 VITA_AUDIO_PROFILE = "LC"
 VITA_AUDIO_SAMPLE_RATE = 48_000
 VITA_AUDIO_MAX_CHANNELS = 2
+# AAC-LC: 6144 bits/channel per 1024 samples. VitaSDK's AAC ES buffer
+# accepts 1536 bytes. At stereo/48 kHz both bounds give 576 kb/s.
+VITA_AAC_MAX_ES_BYTES = 1536
+AAC_LC_FRAME_SAMPLES = 1024
+AAC_LC_BITS_PER_CHANNEL = 6144
+AAC_OUTPUT_MAX_KBPS = min(AAC_LC_BITS_PER_CHANNEL * VITA_AUDIO_MAX_CHANNELS,
+                         VITA_AAC_MAX_ES_BYTES * 8) * VITA_AUDIO_SAMPLE_RATE // AAC_LC_FRAME_SAMPLES // 1000
+AUDIO_BITRATE_STEPS = (32, 48, 64, 80, 96, 112, 128, 160, 192, 224, 256, 288, 320, 384, 448, 512, 576)
 COVER_THUMBNAIL_WINDOW_FRAMES = 120
 COVER_BLACK_YAVG_MAX = 10.0
 COVER_BLACK_YMAX_MAX = 32.0
@@ -54,18 +65,32 @@ ENCODER_NAMES = {
     "vaapi": "h264_vaapi",
     "x264": "libx264",
 }
-QUALITY_BPP = {"compact": 0.10, "balanced": 0.14, "high": 0.18}
+QUALITY_BPP = {"compact": 0.10, "balanced": 0.14, "high": 0.18, "maximum": 0.22}
 QUALITY_LIMITS = {
     "compact": (1_400_000, 4_000_000),
     "balanced": (1_800_000, 5_000_000),
     "high": (2_400_000, 6_000_000),
+    "maximum": (3_000_000, 7_200_000),
 }
-CONTENT_TUNES = ("movie", "anime", "anime-grain")
+CONTENT_TUNES = ("movie", "film-grain", "anime", "anime-grain", "vita-sw")
 X264_CONTENT_TUNES = {
     "movie": "film",
+    "film-grain": "grain",
     "anime": "animation",
     "anime-grain": "grain",
+    "vita-sw": "film,fastdecode",
 }
+VIDEO_OPTION_CHOICES = {
+    "encode_speed": ("fast", "medium", "slow", "veryslow"),
+    "denoise": ("off", "light", "medium", "strong", "nlmeans"),
+    "sharpen": ("off", "light", "medium"),
+    "deband": ("off", "light", "medium"),
+    "scaler": ("auto", "apple", "lanczos", "bicubic", "spline"),
+    "filter_backend": ("auto", "cpu", "apple-gpu"),
+}
+VIDEO_OPTION_DEFAULTS = dict(encode_speed="slow", denoise="off", sharpen="off", deband="off", scaler="auto", filter_backend="auto")
+
+
 PROGRESS_PREFIX = "@@VMD_PROGRESS@@"
 RESUME_STATE_VERSION = 1
 PREFLIGHT_SECONDS = 3.0
@@ -174,6 +199,7 @@ class EncoderPlan:
     key: str
     codec: str
     hw_decode: bool
+    filter_options: dict[str, str] | None = None
 
 
 def command_text(command: Sequence[str]) -> str:
@@ -229,6 +255,8 @@ def run_transcode_guarded(
     expected_duration: float | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     """Stream FFmpeg output and abort only after sustained frame-counter stagnation."""
+    emit_progress('transcode', 'video_start', 'VIDEO PASS', progress=0.0,
+                  media_seconds=0.0, duration=expected_duration, video_fps=float(expected_fps))
     process = subprocess.Popen(
         prioritized_command(command, system_load),
         stdout=None,
@@ -256,6 +284,7 @@ def run_transcode_guarded(
     last_frame_change = time.monotonic()
     last_progress_ratio = -1.0
     starvation: tuple[int, float, float] | None = None
+    filter_fault = ''
     while True:
         try:
             raw_chunk = chunks.get(timeout=0.20)
@@ -272,18 +301,21 @@ def run_transcode_guarded(
         parts = re.split(r"[\r\n]", buffer)
         buffer = parts.pop()
         for line in parts:
+            if filter_output_failed(line):
+                filter_fault = line.strip()
             frame_match = re.search(r"(?:^|\s)frame=\s*(\d+)", line)
             media_seconds = progress_time_seconds(line)
-            if media_seconds is not None and expected_duration and expected_duration > 0:
-                progress_ratio = max(0.0, min(1.0, media_seconds / expected_duration))
+            if frame_match and expected_duration and expected_duration > 0:
+                encoded_seconds, progress_ratio = video_progress.encoded_position(int(frame_match.group(1)), expected_fps, expected_duration)
                 if progress_ratio >= last_progress_ratio + 0.005 or progress_ratio >= 1.0:
                     emit_progress(
                         "transcode",
                         "progress",
                         "VIDEO PASS",
                         progress=progress_ratio,
-                        media_seconds=media_seconds,
+                        media_seconds=encoded_seconds,
                         duration=expected_duration,
+                        frame=int(frame_match.group(1)), video_fps=float(expected_fps),
                     )
                     last_progress_ratio = progress_ratio
             if not frame_match or media_seconds is None or media_seconds < 30.0:
@@ -318,6 +350,8 @@ def run_transcode_guarded(
         )
     returncode = process.wait()
     reader_thread.join(timeout=0.5)
+    if filter_fault:
+        raise TranscodeError('Hardware filtering failed: ' + filter_fault + '. Select CPU filters or check GPU availability.')
     return subprocess.CompletedProcess(list(command), returncode)
 
 
@@ -456,10 +490,10 @@ def normalize_fps(value: Fraction) -> Fraction:
         Fraction(60_000, 1_001),
         Fraction(60, 1),
     )
-    for standard in standards:
-        relative_error = abs(float(value - standard)) / float(standard)
-        if relative_error <= 0.001:
-            return standard
+    standard = min(standards, key=lambda candidate: abs(float(value - candidate)) / float(candidate))
+    relative_error = abs(float(value - standard)) / float(standard)
+    if relative_error <= 0.001:
+        return standard
     return value.limit_denominator(100_000)
 
 
@@ -667,6 +701,19 @@ def target_fps(source_fps: Fraction, max_fps: Fraction) -> Fraction:
     return chosen.limit_denominator(100_000)
 
 
+def audio_bitrate_limit(source_bps: int | None = None) -> int:
+    return min(AAC_OUTPUT_MAX_KBPS, max(1, source_bps // 1000)) if source_bps else AAC_OUTPUT_MAX_KBPS
+
+
+def audio_bitrate_target(requested_kbps: int, source_bps: int | None = None) -> int:
+    return min(requested_kbps, audio_bitrate_limit(source_bps))
+
+
+def audio_bitrate_choices(source_rates: Sequence[int | None] = ()) -> tuple[int, ...]:
+    ceiling = max((audio_bitrate_limit(rate) for rate in source_rates), default=AAC_OUTPUT_MAX_KBPS)
+    return tuple(sorted({rate for rate in AUDIO_BITRATE_STEPS if rate <= ceiling} | {ceiling}))
+
+
 def target_audio_bitrates(
     info: MediaInfo,
     selected_audio_tracks: Sequence[int],
@@ -681,8 +728,7 @@ def target_audio_bitrates(
     targets: list[int] = []
     for ordinal in selected_audio_tracks:
         source_bps = info.audio_bit_rates[ordinal]
-        source_kbps = source_bps // 1000 if source_bps else None
-        targets.append(min(requested_kbps, source_kbps) if source_kbps else requested_kbps)
+        targets.append(audio_bitrate_target(requested_kbps, source_bps))
     return tuple(targets)
 
 
@@ -753,6 +799,15 @@ def resolved_audio_bitrates(
     return target_audio_bitrates(measured_info, selected_audio_tracks, requested_kbps)
 
 
+def video_options(settings) -> dict[str, str]:
+    values = settings if isinstance(settings, dict) else vars(settings)
+    return {key: values.get(key, default) for key, default in VIDEO_OPTION_DEFAULTS.items()}
+
+
+def video_option_arguments(settings) -> list[str]:
+    return [part for key, value in video_options(settings).items() for part in ("--" + key.replace("_", "-"), value)]
+
+
 def bitrate_plan(
     width: int,
     height: int,
@@ -760,6 +815,10 @@ def bitrate_plan(
     quality: str,
     content_tune: str = "movie",
 ) -> tuple[int, int, int]:
+    if quality == "maximum":
+        target, maximum, _ = bitrate_plan(width, height, fps, "high", content_tune)
+        target, maximum = round(target * 1.25 / 100000) * 100000, min(14000000, round(maximum * 1.25 / 100000) * 100000)
+        return target, maximum, maximum * 2
     if quality == "high" and width == OUTPUT_WIDTH and height == OUTPUT_HEIGHT:
         cadence = float(fps)
         if cadence <= 24.1:
@@ -770,13 +829,13 @@ def bitrate_plan(
             targets = {"movie": 5_000_000, "anime": 4_500_000, "anime-grain": 5_500_000}
         else:
             targets = {"movie": 5_600_000, "anime": 5_200_000, "anime-grain": 6_000_000}
-        target = targets[content_tune]
+        target = targets["anime-grain" if content_tune == "film-grain" else "movie" if content_tune == "vita-sw" else content_tune]
         maxrate = 4_500_000 if cadence <= 30.1 else 8_000_000
         return target, maxrate, maxrate * 2
 
     minimum, maximum = QUALITY_LIMITS[quality]
     estimated = width * height * float(fps) * QUALITY_BPP[quality]
-    estimated *= {"movie": 1.0, "anime": 0.9, "anime-grain": 1.1}[content_tune]
+    estimated *= {"movie": 1.0, "film-grain": 1.1, "anime": 0.9, "anime-grain": 1.1, "vita-sw": 1.0}[content_tune]
     target = max(minimum, min(maximum, int(round(estimated / 100_000.0)) * 100_000))
     maxrate = min(14_000_000, int(round(target * 1.3 / 100_000.0)) * 100_000)
     return target, maxrate, maxrate * 2
@@ -787,6 +846,13 @@ def h264_level(width: int, height: int, fps: Fraction) -> str:
     return "3.2" if fps > Fraction(30, 1) else "3.1"
 
 
+def filter_output_failed(stderr) -> bool:
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors='replace')
+    return any(message in stderr for message in ('Cannot create valid output image',
+        'Input image could not be initialized', 'Filter output not available', 'CGBitmap context cannot be created'))
+
+
 def filter_chain(
     info: MediaInfo,
     width: int,
@@ -795,10 +861,29 @@ def filter_chain(
     encoder_key: str,
     capabilities: Capabilities,
     tone_map: str,
+    video_options: dict[str, str] | None = None,
 ) -> str:
     filters: list[str] = []
+    options = {**VIDEO_OPTION_DEFAULTS, **(video_options or {})}
+    for key, choices in VIDEO_OPTION_CHOICES.items():
+        if options[key] not in choices:
+            raise TranscodeError(f"Invalid {key}: {options[key]}")
+    scaler = options['scaler']
+    if scaler == 'auto':
+        scaler = 'lanczos'  # Pure graph construction; execution resolves Auto first.
+    apple_scale = scaler == 'apple'
+    if apple_scale:
+        if 'scale_vt' not in capabilities.filters:
+            raise TranscodeError('Apple hardware scaling is unavailable in this FFmpeg.')
+        pixel_format = 'p010le' if info.hdr else 'nv12'
+        if not options.get('_vt_input'):
+            filters.extend([f'format={pixel_format}', 'hwupload'])
+        if info.interlaced and 'yadif_videotoolbox' in capabilities.filters:
+            filters.append('yadif_videotoolbox=mode=send_frame:parity=auto:deint=interlaced')
+        filters.extend([f'scale_vt=w={content_dimensions(info)[0]}:h={content_dimensions(info)[1]}',
+                        'hwdownload', f'format={pixel_format}'])
     content_width, content_height = content_dimensions(info)
-    if info.interlaced:
+    if info.interlaced and not (apple_scale and 'yadif_videotoolbox' in capabilities.filters):
         # Do not double a 25/29.97 fps source to its field cadence.  The
         # transcoder preserves the source frame rate by deinterlacing one
         # output frame per input frame.
@@ -815,27 +900,47 @@ def filter_chain(
             )
         filters.extend(
             [
-                f"zscale=w={content_width}:h={content_height}:filter=lanczos:t=linear:npl=100",
+                f"zscale=w={content_width}:h={content_height}:filter={'spline36' if scaler == 'spline' else 'lanczos' if apple_scale else scaler}:t=linear:npl=100",
                 "format=gbrpf32le",
                 "zscale=p=bt709",
                 f"tonemap=tonemap={tone_map}:desat=2",
                 "zscale=t=bt709:m=bt709:r=limited:d=error_diffusion",
                 "format=yuv420p",
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
             ]
         )
     else:
         filters.extend(
             [
                 (
-                    f"scale={width}:{height}:force_original_aspect_ratio=decrease:"
-                    "force_divisible_by=2:flags=lanczos"
+                    f"scale={content_width}:{content_height}:flags={'lanczos' if apple_scale else scaler}"
                 ),
                 "format=yuv420p",
-                f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black",
             ]
         )
 
+    effects, apple_filters = [], []
+    apple = options['filter_backend'] == 'apple-gpu'
+    if apple and options['denoise'] in ('light', 'medium', 'strong'):
+        strength = {'light': '0.01', 'medium': '0.02', 'strong': '0.04'}[options['denoise']]
+        apple_filters.append(f'CINoiseReduction@inputNoiseLevel={strength}@inputSharpness=0')
+    elif options['denoise'] != 'off':
+        effects.append('nlmeans=s=1.5:p=7:r=9' if options['denoise'] == 'nlmeans' else
+                       'hqdn3d=' + {'light': '1.5:1.5:3:3', 'medium': '3:2.25:4.5:3.375', 'strong': '4:3:6:4.5'}[options['denoise']])
+    if apple and options['sharpen'] != 'off':
+        apple_filters.append('CISharpenLuminance@inputSharpness=' + ('0.3' if options['sharpen'] == 'light' else '0.6'))
+    if apple_filters:
+        effects += ['format=argb', 'coreimage=filter=' + '#'.join(apple_filters), 'format=yuv420p']
+    if options['deband'] != 'off':
+        threshold = '0.008' if options['deband'] == 'light' else '0.016'
+        effects.append(f'deband=1thr={threshold}:2thr={threshold}:3thr={threshold}:4thr={threshold}:range=16:blur=1')
+    if options['sharpen'] != 'off' and not apple:
+        effects.append('unsharp=5:5:' + ('0.3' if options['sharpen'] == 'light' else '0.6') + ':5:5:0')
+    for effect in effects:
+        name = effect.split('=')[0]
+        if name not in capabilities.filters:
+            raise TranscodeError(f"Selected video filter {name} is unavailable in this FFmpeg. Disable it or choose another FFmpeg executable.")
+    filters.extend(effects)
+    filters.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black")
     filters.append("setsar=1")
     filters.append(f"fps={fps.numerator}/{fps.denominator}")
     filters.append(f"setpts=N*{fps.denominator}/({fps.numerator}*TB)")
@@ -871,6 +976,10 @@ def encoder_candidates(requested: str, capabilities: Capabilities, vaapi_device:
     return available
 
 
+def quality_crf(quality: str, content_tune: str) -> str:
+    return {"maximum": "16", "high": "17.5" if content_tune == 'anime' else "18", "balanced": "20", "compact": "23"}[quality]
+
+
 def encoder_arguments(
     key: str,
     level: str,
@@ -879,7 +988,12 @@ def encoder_arguments(
     bufsize_bps: int,
     gop: int,
     content_tune: str,
+    quality: str = "high",
+    encode_speed: str = "slow",
 ) -> list[str]:
+    if content_tune == "vita-sw" and key != "x264":
+        raise TranscodeError("Vita SW tuning requires the x264 encoder; select x264 or a Vita SW preset.")
+    crf = quality_crf(quality, content_tune)
     args = [
         "-c:v",
         ENCODER_NAMES[key],
@@ -923,7 +1037,7 @@ def encoder_arguments(
                 "-rc",
                 "vbr",
                 "-cq",
-                "18",
+                crf,
                 "-multipass",
                 "fullres",
                 "-spatial_aq",
@@ -957,15 +1071,15 @@ def encoder_arguments(
         args.extend(
             [
                 "-preset",
-                "slow",
+                encode_speed,
                 "-tune",
                 X264_CONTENT_TUNES[content_tune],
                 "-crf",
-                "17.5" if content_tune == "anime" else "18",
+                crf,
                 "-bf",
-                "2",
+                "0" if content_tune == "vita-sw" else "2",
                 "-refs",
-                "3",
+                "1" if content_tune == "vita-sw" else "3",
             ]
         )
     return args
@@ -993,7 +1107,15 @@ def build_command(
     system_load: str = "balanced",
     preserve_extras: bool = True,
     audio_bitrates: Sequence[int] | None = None,
+    video_options: dict[str, str] | None = None,
 ) -> list[str]:
+    requested_options = {**VIDEO_OPTION_DEFAULTS, **(video_options or {})}
+    if requested_options['filter_backend'] == 'auto' or requested_options['scaler'] == 'auto':
+        import vmd_processing
+        video_options, _ = vmd_processing.resolve(ffmpeg, source, info, capabilities, encoder_key, use_hw_decode,
+            fps, quality, content_tune, tone_map, vaapi_device, system_load, requested_options)
+    else:
+        video_options = requested_options
     target_bps, maxrate_bps, bufsize_bps = bitrate_plan(
         width, height, fps, quality, content_tune
     )
@@ -1017,7 +1139,13 @@ def build_command(
         command.extend(["-loglevel", "error"])
     if encoder_key == "vaapi":
         command.extend(["-vaapi_device", str(vaapi_device)])
-    if use_hw_decode and encoder_key != "vaapi":
+    apple_scale = video_options['scaler'] == 'apple'
+    if apple_scale:
+        command.extend(['-init_hw_device', 'videotoolbox=vmdvt', '-filter_hw_device', 'vmdvt'])
+        if use_hw_decode:
+            command.extend(['-hwaccel', 'videotoolbox', '-hwaccel_device', 'vmdvt', '-hwaccel_output_format', 'videotoolbox_vld'])
+            video_options = {**video_options, '_vt_input': True}
+    elif use_hw_decode and encoder_key != "vaapi":
         command.extend(["-hwaccel", "auto"])
     command.extend(["-i", str(source)])
     if preflight:
@@ -1044,7 +1172,7 @@ def build_command(
     command.extend(
         [
             "-vf",
-            filter_chain(info, width, height, fps, encoder_key, capabilities, tone_map),
+            filter_chain(info, width, height, fps, encoder_key, capabilities, tone_map, video_options),
             "-r",
             f"{fps.numerator}/{fps.denominator}",
             "-fps_mode",
@@ -1060,6 +1188,8 @@ def build_command(
             bufsize_bps,
             gop,
             content_tune,
+            quality,
+            (video_options or {}).get('encode_speed', 'slow'),
         )
     )
     if thread_limit and encoder_key == "x264":
@@ -1360,6 +1490,7 @@ def preflight_encoder(
     tone_map: str,
     vaapi_device: Path,
     system_load: str,
+    video_options: dict[str, str] | None = None,
 ) -> EncoderPlan | None:
     decode_modes = [True, False] if prefer_hw_decode and key != "vaapi" else [False]
     for hw_decode in decode_modes:
@@ -1381,6 +1512,7 @@ def preflight_encoder(
             vaapi_device,
             preflight=True,
             system_load=system_load,
+            video_options=video_options,
         )
         result = subprocess.run(
             prioritized_command(command, system_load),
@@ -1394,8 +1526,8 @@ def preflight_encoder(
         frame_count = reported_frames[-1] if reported_frames else 0
         probe_duration = min(PREFLIGHT_SECONDS, info.duration or PREFLIGHT_SECONDS)
         minimum_frames = max(1, int(float(fps) * probe_duration * 0.60))
-        if result.returncode == 0 and frame_count >= minimum_frames:
-            return EncoderPlan(key=key, codec=ENCODER_NAMES[key], hw_decode=hw_decode)
+        if result.returncode == 0 and frame_count >= minimum_frames and not filter_output_failed(result.stderr):
+            return EncoderPlan(key=key, codec=ENCODER_NAMES[key], hw_decode=hw_decode, filter_options=video_options)
         mode = "hardware decode" if hw_decode else "software decode"
         if result.returncode == 0:
             print(
@@ -1421,6 +1553,8 @@ def preflight_encoder(
             error_lines[-1] if error_lines else "unknown FFmpeg error",
         )
         print(f"Preflight rejected {ENCODER_NAMES[key]} ({mode}): {last_line}", file=sys.stderr)
+        if result.stderr.strip():
+            print(result.stderr.strip(), file=sys.stderr)
     return None
 
 
@@ -1439,6 +1573,7 @@ def fallback_video_plan(
     tone_map: str,
     vaapi_device: Path,
     system_load: str,
+    video_options: dict[str, str] | None = None,
 ) -> EncoderPlan:
     candidates: list[str] = []
     if current.hw_decode:
@@ -1462,6 +1597,7 @@ def fallback_video_plan(
             tone_map,
             vaapi_device,
             system_load,
+            video_options=video_options,
         )
         if candidate is not None:
             return candidate
@@ -1594,7 +1730,7 @@ def validate_output(
 
 
 def default_output(source: Path) -> Path:
-    return source.with_name(f"{source.stem}.vitamediadeck.mkv")
+    return workflow.output_file(source.with_name(f"{source.stem}.vitamediadeck.mkv"))
 
 
 def default_batch_output(source: Path) -> Path:
@@ -1604,24 +1740,43 @@ def default_batch_output(source: Path) -> Path:
 
 def batch_output_path(source_root: Path, output_root: Path, source: Path) -> Path:
     relative = source.relative_to(source_root)
-    return (output_root / relative).with_name(f"{relative.stem}.vitamediadeck.mkv")
+    return workflow.output_file((output_root / relative).with_name(f"{relative.stem}.vitamediadeck.mkv"))
 
 
-def partial_output_paths(output: Path) -> tuple[Path, ...]:
+def partial_output_paths(output: Path, support: Path | None = None) -> tuple[Path, ...]:
     """List only transient files that this transcoder itself creates."""
+    support = support or workflow.media_support_directory(output)
+    prefix = f'.{output.name}.'
     return (
+        support / f"{prefix}video.partial{output.suffix}",
+        support / f"{prefix}audio-repair.mka",
+        support / f"{prefix}repaired.partial{output.suffix}",
+        support / f"{prefix}cover.jpg",
+        support / f"{prefix}covered.partial{output.suffix}",
+    )
+
+
+def cleanup_partial_output(output: Path, support: Path | None = None) -> None:
+    support = support or workflow.media_support_directory(output)
+    # Explicit recovery also removes temporary files left by older releases.
+    legacy = (
         output.with_name(f".{output.stem}.partial{output.suffix}"),
         output.with_name(f".{output.stem}.audio-repair.mka"),
         output.with_name(f".{output.stem}.repaired.partial{output.suffix}"),
         output.with_name(f".{output.stem}.cover.jpg"),
         output.with_name(f".{output.stem}.covered.partial{output.suffix}"),
     )
-
-
-def cleanup_partial_output(output: Path) -> None:
-    for temporary in partial_output_paths(output):
+    old_support = tuple(support / name for name in (f'video.partial{output.suffix}', 'audio-repair.mka',
+        f'repaired.partial{output.suffix}', 'cover.jpg', f'covered.partial{output.suffix}')) if workflow.SUPPORT_FOLDER in support.parts else ()
+    for temporary in (*partial_output_paths(output, support), *legacy, *old_support):
         if temporary.is_file():
             temporary.unlink()
+
+
+def output_was_replaced(entry: dict[str, Any], output: Path) -> bool:
+    """An old valid file is not completion of an interrupted replacement."""
+    previous = entry.get("previous_output")
+    return not previous or (output.is_file() and workflow.fingerprint(output) != previous)
 
 
 def resume_output_is_valid(
@@ -1701,6 +1856,8 @@ def resume_entries(
         item_output = Path(str(item.get("output") or "")).expanduser().resolve()
         if not item_source.is_file():
             raise TranscodeError(f"A saved input file no longer exists: {item_source}")
+        if item.get("fingerprint") and item["fingerprint"] != workflow.fingerprint(item_source):
+            raise TranscodeError(f"A saved input file has changed: {item_source}")
         if mode == "batch" and source not in item_source.parents:
             raise TranscodeError(f"Saved input is outside the original folder: {item_source}")
         if mode == "batch" and output not in item_output.parents:
@@ -1708,9 +1865,7 @@ def resume_entries(
         entries.append((item_source, item_output))
     if mode == "file" and entries != [(source, output)]:
         raise TranscodeError("The resume state does not match the selected input/output file.")
-    if mode == "batch" and [item_source for item_source, _ in entries] != batch_video_sources(
-        source
-    ):
+    if mode == "batch" and {item_source for item_source, _ in entries} != set(batch_video_sources(source)):
         raise TranscodeError(
             "The files in the source folder changed after the resume state was saved."
         )
@@ -1720,6 +1875,16 @@ def resume_entries(
 def batch_video_sources(source: Path) -> list[Path]:
     """Return video files physically inside the selected folder, recursively."""
     source = source.resolve()
+    generated = {}
+    def generated_parent(candidate):
+        for parent in candidate.parents:
+            if parent == source:
+                break
+            if parent not in generated:
+                generated[parent] = workflow.is_generated_directory(parent)
+            if generated[parent]:
+                return True
+        return False
     return sorted(
         (
             candidate
@@ -1727,7 +1892,9 @@ def batch_video_sources(source: Path) -> list[Path]:
             if candidate.is_file()
             and source in candidate.resolve().parents
             and not candidate.name.startswith("._")
+            and workflow.SUPPORT_FOLDER not in candidate.relative_to(source).parts[:-1]
             and candidate.suffix.lower() in VIDEO_EXTENSIONS
+            and not generated_parent(candidate)
         ),
         key=lambda candidate: str(candidate.relative_to(source)).casefold(),
     )
@@ -1753,8 +1920,10 @@ def saved_batch_entries(
 
 def with_batch_settings(args: argparse.Namespace, settings: dict[str, Any]) -> argparse.Namespace:
     """Apply a TUI per-media settings snapshot to one child conversion only."""
+    if 'filter_backend' not in settings and all(key in settings for key in ('encoder', 'quality', 'content_tune', 'audio_bitrate')):
+        settings = {**settings, 'filter_backend': 'cpu', 'scaler': settings.get('scaler', 'lanczos')}
     child = argparse.Namespace(**vars(args))
-    for attribute in (
+    for attribute in (*VIDEO_OPTION_DEFAULTS,
         "encoder",
         "quality",
         "content_tune",
@@ -1766,12 +1935,17 @@ def with_batch_settings(args: argparse.Namespace, settings: dict[str, Any]) -> a
         "vaapi_device",
         "ffmpeg",
         "ffprobe",
-        "overwrite",
     ):
         if attribute in settings:
             setattr(child, attribute, settings[attribute])
+    child.overwrite = args.overwrite or bool(settings.get("overwrite", False))
     if "hw_decode" in settings:
         child.no_hw_decode = not bool(settings["hw_decode"])
+    for field, flag in (("audio_tracks", "no_audio"), ("subtitle_tracks", "no_subtitles")):
+        if field in settings:
+            chosen = settings[field]
+            setattr(child, "audio_track" if field == "audio_tracks" else "subtitle_track", chosen or None)
+            setattr(child, flag, chosen is not None and not chosen)
     cover_mode = settings.get("cover_mode")
     if cover_mode == "none":
         child.no_cover = True
@@ -1813,6 +1987,7 @@ def batch_child_command(args: argparse.Namespace, source: Path, output: Path) ->
         "--ffprobe",
         args.ffprobe,
     ]
+    command.extend(video_option_arguments(args))
     if args.force_hdr:
         command.append("--force-hdr")
     if args.no_hw_decode:
@@ -1862,7 +2037,10 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
     ]:
         relative = video.relative_to(source)
         target = saved_target or batch_output_path(source, output_root, video)
-        target_key = str(target).casefold()
+        resolved_target = target.resolve()
+        if output_root not in resolved_target.parents:
+            raise TranscodeError(f"Batch output resolves outside the selected destination: {target}")
+        target_key = str(resolved_target).casefold()
         previous = seen_targets.get(target_key)
         if previous is not None:
             raise TranscodeError(
@@ -1884,43 +2062,164 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
         resume_ffprobe = ""
     else:
         resume_ffprobe = ""
+    old_state = workflow.read_json(state_path) if state_path else {}
+    legacy_job = bool(state_path and old_state.get('layout') != workflow.LAYOUT)
+    checkpoint = ((args.resume_state.expanduser().resolve() if args.resume_state else
+                   workflow.legacy_directory(output_root, True) / 'resume.json') if legacy_job
+                  else workflow.recovery_path(output_root, True))
+    old_entries = {item["source"]: item for item in old_state.get("entries", [])}
+    for video in sources:
+        target = targets[video]
+        if old_entries.get(str(video), {}).get("enabled", True) and target.exists() and not target.is_file():
+            raise TranscodeError(f"The output path is not a regular file: {target}")
+    # Refuse the whole queue before encoding anything if replacement was not
+    # authorized. Per-media plans can authorize only the conflicting targets.
+    if not args.resume_state:
+        conflicts = [targets[video] for video in sources
+                     if old_entries.get(str(video), {}).get("enabled", True)
+                     and targets[video].exists()
+                     and not with_batch_settings(args, settings_by_source[video]).overwrite]
+        if conflicts:
+            raise TranscodeError(f"{len(conflicts)} output file(s) already exist (use --overwrite): {conflicts[0]}")
+    if args.dry_run:
+        for video in sources:
+            result = subprocess.run(batch_child_command(with_batch_settings(args, settings_by_source[video]), video, targets[video]))
+            if result.returncode:
+                return result.returncode
+        return 0
+    entries = []
+    _, probe, _ = resolve_media_tools(args.ffmpeg, args.ffprobe)
+    for video in sources:
+        old = old_entries.get(str(video), {})
+        try:
+            duration = probe_media(probe, video, False).duration
+        except (TranscodeError, OSError, ValueError):
+            duration = None
+        entries.append({"source": str(video), "output": str(targets[video]),
+                        "settings": settings_by_source[video], "fingerprint": workflow.fingerprint(video),
+                        "duration": duration, "enabled": old.get("enabled", True),
+                        "previous_output": (old.get("previous_output") if args.resume_state else
+                                            workflow.fingerprint(targets[video]) if targets[video].is_file() else None),
+                        "status": "pending", "error": "", "elapsed": 0})
+    state = {"version": RESUME_STATE_VERSION, "mode": "batch", "application": "VitaMediaDeck Transcoder",
+             "layout": 'legacy' if legacy_job else workflow.LAYOUT, "input_path": str(source),
+             "output_path": str(output_root), "settings": old_state.get("settings", {
+                 **{key: getattr(args, key) for key in ("encoder", "quality", "content_tune", "max_fps", "audio_bitrate", "system_load", "tone_map", "ffmpeg", "ffprobe", "force_hdr")},
+                 **video_options(args),
+                 "hw_decode": not args.no_hw_decode,
+                 "cover_mode": "none" if args.no_cover else "custom" if args.cover_image else "auto",
+                 "cover_image": str(args.cover_image or ""),
+             }), "entries": entries}
+    workflow.atomic_json(checkpoint, state)
+    print(f"Automatic recovery: {checkpoint}", flush=True)
+    active_entries = [entry for entry in entries if entry["enabled"]]
+    total_weight = sum(workflow.weight(entry["duration"]) for entry in active_entries)
+    completed_weight = 0.0
     failures: list[Path] = []
-    for index, video in enumerate(sources, start=1):
+    interrupted = False
+    for entry in entries:
+        if not entry["enabled"]:
+            entry["status"] = "excluded"
+    workflow.atomic_json(checkpoint, state)
+    for index, entry in enumerate(active_entries, start=1):
+        video = Path(entry["source"])
         relative = video.relative_to(source)
         target = targets[video]
         child_args = with_batch_settings(args, settings_by_source[video])
-        print(f"\n[BATCH {index}/{len(sources)}] {relative}", flush=True)
+        context = dict(batch_index=index, batch_total=len(active_entries), batch_source=str(relative),
+                       batch_duration=entry['duration'],
+                       batch_weight=workflow.weight(entry["duration"]), batch_completed_weight=completed_weight,
+                       batch_total_weight=total_weight)
+        print(f"\n[BATCH {index}/{len(active_entries)}] {relative}", flush=True)
         if args.resume_state:
-            cleanup_partial_output(target)
-            if resume_output_is_valid(resume_ffprobe, video, target, child_args):
+            cleanup_partial_output(target, workflow.legacy_directory(target, batch_root=output_root) if legacy_job else target.parent)
+            if (output_was_replaced(old_entries.get(str(video), {}), target)
+                    and resume_output_is_valid(resume_ffprobe, video, target, child_args)):
                 print(f"[BATCH {index}/{len(sources)}] SKIPPED: completed output is valid", flush=True)
-                emit_progress(
-                    "complete",
-                    "done",
-                    "resumed existing output",
-                    batch_index=index,
-                    batch_total=len(sources),
-                    batch_source=str(relative),
-                )
+                entry["status"] = "skipped"
+                entry.pop("previous_output", None)
+                entry["output_bytes"] = target.stat().st_size
+                workflow.atomic_json(checkpoint, state)
+                emit_progress("complete", "done", "resumed existing output", **context)
+                completed_weight += workflow.weight(entry["duration"])
                 continue
+            child_args.overwrite = True
+        entry["status"] = "running"
+        entry["previous_output"] = workflow.fingerprint(target) if target.is_file() else None
+        workflow.atomic_json(checkpoint, state)
+        emit_progress("analysis", "start", "Inspecting queue item", **context)
         child_env = {
             **os.environ,
             "VMD_BATCH_INDEX": str(index),
-            "VMD_BATCH_TOTAL": str(len(sources)),
+            "VMD_BATCH_TOTAL": str(len(active_entries)),
             "VMD_BATCH_SOURCE": str(relative),
+            "VMD_MEDIA_SUPPORT_DIR": str(workflow.legacy_directory(target, batch_root=output_root) if legacy_job else target.parent),
+            "VMD_CONVERSION_LAYOUT": 'legacy' if legacy_job else workflow.LAYOUT,
         }
-        result = subprocess.run(
-            batch_child_command(child_args, video, target),
-            check=False,
-            env=child_env,
-        )
-        if result.returncode != 0:
+        log_path = Path(child_env['VMD_MEDIA_SUPPORT_DIR']) / "transcode.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        entry["log"] = str(log_path)
+        started = time.monotonic()
+        returncode = 2
+        try:
+            with log_path.open("w", encoding="utf-8") as log:
+                child_env["PYTHONUNBUFFERED"] = "1"
+                with subprocess.Popen(batch_child_command(child_args, video, target), env=child_env,
+                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                      text=True, errors="replace") as child:
+                    assert child.stdout is not None
+                    try:
+                        for line in child.stdout:
+                            log.write(line)
+                            if line.startswith(PROGRESS_PREFIX):
+                                payload = json.loads(line[len(PROGRESS_PREFIX):])
+                                payload.update(context)
+                                print(PROGRESS_PREFIX + json.dumps(payload), flush=True)
+                            else:
+                                print(line, end="", flush=True)
+                                if "Error:" in line:
+                                    entry["error"] = line.strip()
+                        returncode = child.wait()
+                    except KeyboardInterrupt:
+                        # The TUI interrupts the process group, while direct CLI
+                        # callers may interrupt only the parent. Always reap it.
+                        if child.poll() is None:
+                            child.terminate()
+                            try:
+                                child.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                child.kill()
+                                child.wait()
+                        raise
+                if returncode in (130, -2):
+                    interrupted = True
+        except KeyboardInterrupt:
+            interrupted = True
+            entry["error"] = "Interrupted; restart this item from the beginning."
+        except OSError as exc:
+            entry["error"] = str(exc)
+        entry["elapsed"] = round(time.monotonic() - started, 2)
+        entry["status"] = "done" if returncode == 0 else "interrupted" if interrupted else "failed"
+        entry["output_bytes"] = target.stat().st_size if target.is_file() else 0
+        workflow.atomic_json(checkpoint, state)
+        if returncode != 0:
             failures.append(relative)
             print(
                 f"[BATCH {index}/{len(sources)}] FAILED: {relative}",
                 file=sys.stderr,
                 flush=True,
             )
+        completed_weight += workflow.weight(entry["duration"])
+        emit_progress("queue", entry["status"], entry.get("error", ""), **context)
+        if interrupted:
+            break
+
+    report_path = (workflow.legacy_directory(output_root, True) if legacy_job else output_root) / "report.json"
+    workflow.atomic_json(report_path, state)
+    print(f"\nReport: {report_path}", flush=True)
+    for entry in entries:
+        print(f"{entry['status'].upper():12} {Path(entry['source']).relative_to(source)} "
+              f"({entry.get('output_bytes', 0)} bytes, {entry['elapsed']}s) {entry['error']}", flush=True)
 
     if failures:
         print(
@@ -1929,7 +2228,7 @@ def convert_directory(args: argparse.Namespace, source: Path) -> int:
             file=sys.stderr,
             flush=True,
         )
-        return 2
+        return 130 if interrupted else 2
     print(
         f"\nBatch complete: {len(sources)} file(s) converted to {output_root}",
         flush=True,
@@ -2010,6 +2309,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             "Hardware encoding is preferred automatically."
         )
     )
+    parser.add_argument("--version", action="version", version=f"VitaMediaDeck Transcoder {APP_VERSION}")
     parser.add_argument(
         "input",
         type=Path,
@@ -2030,8 +2330,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--quality",
         choices=sorted(QUALITY_BPP),
-        default="high",
-        help="quality/size profile (default: high)",
+        default="maximum",
+        help="quality/size profile (default: maximum)",
     )
     parser.add_argument(
         "--content-tune",
@@ -2039,7 +2339,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default="movie",
         help=(
             "source-specific tuning: movie uses x264 film, anime uses animation, "
-            "and anime-grain preserves analog grain (default: movie)"
+            "anime-grain preserves analog grain; vita-sw uses x264 fast-decode (default: movie)"
         ),
     )
     parser.add_argument(
@@ -2047,14 +2347,18 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         default="60",
         help="maximum output fps as a number or rational, never above 60 (default: 60)",
     )
-    parser.add_argument("--audio-bitrate", type=int, default=192, help="AAC-LC output bitrate in kb/s")
+    parser.add_argument("--audio-bitrate", type=int, default=AAC_OUTPUT_MAX_KBPS,
+                        help=f"AAC-LC ceiling per stereo track in kb/s (1-{AAC_OUTPUT_MAX_KBPS}, also capped to source; default: {AAC_OUTPUT_MAX_KBPS})")
+    for key, choices in VIDEO_OPTION_CHOICES.items():
+        parser.add_argument('--' + key.replace('_', '-'), choices=choices,
+                            default=VIDEO_OPTION_DEFAULTS[key], help=f"video {key.replace('_', ' ')} (default: {VIDEO_OPTION_DEFAULTS[key]})")
     parser.add_argument(
         "--system-load",
         choices=tuple(SYSTEM_LOAD_THREADS),
-        default="balanced",
+        default="full",
         help=(
             "desktop resource policy: low uses 2 FFmpeg threads, balanced leaves two "
-            "CPU cores free (up to 8 threads), full removes limits (default: balanced)"
+            "CPU cores free (up to 8 threads), full removes limits (default: full)"
         ),
     )
     audio_group = parser.add_mutually_exclusive_group()
@@ -2130,7 +2434,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
+    single_checkpoint: Path | None = None
+    single_state: dict[str, Any] | None = None
     try:
+        if args.resume_state:
+            saved = load_resume_state(args.resume_state)
+            args = with_batch_settings(args, saved.get("settings", {}))
         source = args.input.expanduser().resolve()
         if source.is_dir():
             return convert_directory(args, source)
@@ -2143,13 +2452,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = (args.output or default_output(source)).expanduser().resolve()
         if source == output:
             raise TranscodeError("Input and output paths must be different.")
+        legacy_job = bool(args.resume_state and saved.get('layout') != workflow.LAYOUT) or bool(
+            os.environ.get('VMD_BATCH_INDEX') and os.environ.get('VMD_CONVERSION_LAYOUT') != workflow.LAYOUT)
+        if not args.resume_state and not os.environ.get('VMD_BATCH_INDEX'):
+            output = workflow.output_file(output).resolve()
+        if not legacy_job and output.parent in source.parents:
+            raise TranscodeError('The conversion folder must not contain the original input file.')
         if output.suffix.lower() != ".mkv":
             raise TranscodeError(
                 "The output must use .mkv so all audio and subtitle track types can be preserved."
             )
+        support = (Path(os.environ["VMD_MEDIA_SUPPORT_DIR"])
+                   if os.environ.get("VMD_BATCH_INDEX") and os.environ.get("VMD_MEDIA_SUPPORT_DIR")
+                   else workflow.legacy_directory(output) if legacy_job else workflow.media_support_directory(output))
+        if output.exists() and not output.is_file():
+            raise TranscodeError(f"The output path is not a regular file: {output}")
         if args.resume_state:
             resume_entries(args.resume_state, "file", source, output)
-            cleanup_partial_output(output)
+            saved_entry = load_resume_state(args.resume_state)["entries"][0]
+            for label in ("audio", "subtitle"):
+                tracks = saved_entry.get(f"{label}_tracks")
+                if tracks is not None:
+                    setattr(args, f"{label}_track", tracks or None)
+                    setattr(args, f"no_{'subtitles' if label == 'subtitle' else 'audio'}", not tracks)
+            cleanup_partial_output(output, support)
+            if output_was_replaced(saved_entry, output) and resume_output_is_valid(ffprobe, source, output, args):
+                print(f"SKIPPED: completed output is valid: {output}")
+                emit_progress("complete", "done", str(output))
+                return 0
             if output.exists():
                 args.overwrite = True
         if output.exists() and not args.overwrite:
@@ -2158,8 +2488,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if custom_cover is not None and not custom_cover.is_file():
             raise TranscodeError(f"Cover image not found: {custom_cover}")
         cover_enabled = not args.no_cover
-        if args.audio_bitrate < 64 or args.audio_bitrate > 320:
-            raise TranscodeError("--audio-bitrate must be between 64 and 320 kb/s.")
+        if args.audio_bitrate < 1 or args.audio_bitrate > AAC_OUTPUT_MAX_KBPS:
+            raise TranscodeError(f"--audio-bitrate must be between 1 and {AAC_OUTPUT_MAX_KBPS} kb/s; each track is also capped to its source bitrate.")
         max_fps = fraction_from_text(args.max_fps)
         if max_fps is None or max_fps > MAX_FPS:
             raise TranscodeError("--max-fps must be greater than zero and no higher than 60.")
@@ -2201,6 +2531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidates[0],
                 capabilities,
                 args.tone_map,
+                video_options(args),
             )
         emit_progress("analysis", "done")
 
@@ -2209,6 +2540,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 candidates[0],
                 ENCODER_NAMES[candidates[0]],
                 prefer_hw_decode and candidates[0] != "vaapi",
+                {**video_options(args), 'filter_backend': 'cpu' if args.filter_backend == 'auto' else args.filter_backend,
+                 'scaler': 'lanczos' if args.scaler == 'auto' else args.scaler},
             )
         else:
             announce_phase(
@@ -2217,33 +2550,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "Testing H.264 encoders and decode paths...",
                 "preflight",
             )
-            plan = next(
-                (
-                    result
-                    for key in candidates
-                    if (
-                        result := preflight_encoder(
-                            ffmpeg,
-                            source,
-                            info,
-                            capabilities,
-                            key,
-                            prefer_hw_decode,
-                            width,
-                            height,
-                            fps,
-                            args.quality,
-                            args.content_tune,
-                            args.audio_bitrate,
-                            args.tone_map,
-                            args.vaapi_device,
-                            args.system_load,
-                        )
-                    )
-                    is not None
-                ),
-                None,
-            )
+            import vmd_processing
+            selected_options = video_options(args)
+            if args.encoder == 'auto' or 'auto' in (selected_options['filter_backend'], selected_options['scaler']):
+                selected, report = vmd_processing.select(ffmpeg, source, info, capabilities, args.encoder,
+                    prefer_hw_decode, fps, args.quality, args.content_tune, args.tone_map,
+                    args.vaapi_device, args.system_load, selected_options)
+                print('Auto processing:', selected.key, selected.filter_options, report['policy'])
+                plan = preflight_encoder(ffmpeg, source, info, capabilities, selected.key,
+                    selected.hw_decode, width, height, fps, args.quality, args.content_tune,
+                    args.audio_bitrate, args.tone_map, args.vaapi_device, args.system_load,
+                    video_options=selected.filter_options)
+            else:
+                plan = preflight_encoder(ffmpeg, source, info, capabilities, candidates[0],
+                    prefer_hw_decode, width, height, fps, args.quality, args.content_tune,
+                    args.audio_bitrate, args.tone_map, args.vaapi_device, args.system_load,
+                    video_options=selected_options)
             if plan is None:
                 raise TranscodeError(
                     "Every available H.264 encoder failed its three-second frame preflight."
@@ -2277,11 +2599,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             cover_description,
         )
 
-        temporary = output.with_name(f".{output.stem}.partial{output.suffix}")
-        audio_temporary = output.with_name(f".{output.stem}.audio-repair.mka")
-        repaired_temporary = output.with_name(f".{output.stem}.repaired.partial{output.suffix}")
-        cover_file = output.with_name(f".{output.stem}.cover.jpg")
-        covered_temporary = output.with_name(f".{output.stem}.covered.partial{output.suffix}")
+        temporary, audio_temporary, repaired_temporary, cover_file, covered_temporary = partial_output_paths(output, support)
         command = build_command(
             ffmpeg,
             source,
@@ -2305,6 +2623,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             subtitle_tracks=(),
             system_load=args.system_load,
             preserve_extras=False,
+            video_options=plan.filter_options or video_options(args),
         )
         audio_command = (
             build_audio_repair_command(
@@ -2405,6 +2724,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
 
         output.parent.mkdir(parents=True, exist_ok=True)
+        support.mkdir(parents=True, exist_ok=True)
+        if not os.environ.get("VMD_BATCH_INDEX") or not legacy_job:
+            single_checkpoint = args.resume_state.expanduser().resolve() if legacy_job and args.resume_state else support / "resume.json"
+            settings = {key: getattr(args, key) for key in ("encoder", "quality", "content_tune", "max_fps", "audio_bitrate", "system_load", "tone_map", "force_hdr", "ffmpeg", "ffprobe")}
+            settings.update(video_options(args))
+            settings.update(hw_decode=not args.no_hw_decode, cover_mode="none" if args.no_cover else "custom" if args.cover_image else "auto", cover_image=str(args.cover_image or ""))
+            single_state = {"version": RESUME_STATE_VERSION, "mode": "file", "application": "VitaMediaDeck Transcoder",
+                            "layout": 'legacy' if legacy_job else workflow.LAYOUT, "input_path": str(source),
+                            "output_path": str(output), "settings": settings, "entries": [{
+                                "source": str(source), "output": str(output), "fingerprint": workflow.fingerprint(source),
+                                "audio_tracks": list(selected_audio_tracks), "subtitle_tracks": list(selected_subtitle_tracks),
+                                "previous_output": workflow.fingerprint(output) if output.is_file() else None,
+                                "status": "running"}]}
+            workflow.atomic_json(single_checkpoint, single_state)
         for work_file in (
             temporary,
             audio_temporary,
@@ -2480,6 +2813,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.tone_map,
                     args.vaapi_device,
                     args.system_load,
+                    video_options=plan.filter_options or video_options(args),
                 )
                 if temporary.exists():
                     temporary.unlink()
@@ -2504,11 +2838,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     subtitle_tracks=(),
                     system_load=args.system_load,
                     preserve_extras=False,
+                    video_options=plan.filter_options or video_options(args),
                 )
                 print(f"\nVideo recovery plan: {plan.codec} with software decoding")
                 print(command_text(command))
                 execute_video_attempt(command)
 
+            emit_progress('transcode', 'video_done', 'VIDEO PASS', progress=1.0,
+                          media_seconds=info.duration, duration=info.duration, video_fps=float(fps))
             if audio_command is not None:
                 emit_progress(
                     "transcode",
@@ -2603,6 +2940,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 emit_progress("package", "skipped", "disabled")
                 emit_progress("final_validation", "done", "validated without cover")
             os.replace(final_temporary, output)
+            if single_checkpoint and single_state:
+                single_state["entries"][0].update(status="done", output_bytes=output.stat().st_size)
+                single_state['processing'] = dict(encoder=plan.key, hardware_decode=plan.hw_decode,
+                    filters=plan.filter_options or video_options(args), width=width, height=height, fps=str(fps),
+                    video_target_bps=target_bps, video_max_bps=maxrate_bps, audio_targets_kbps=list(audio_bitrates))
+                workflow.atomic_json(single_checkpoint, single_state)
+                workflow.atomic_json(support / "report.json", single_state)
             emit_progress("complete", "done", str(output))
         finally:
             for work_file in (
@@ -2618,10 +2962,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"\nReady: {output}")
         return 0
     except KeyboardInterrupt:
+        if single_checkpoint and single_state:
+            single_state["entries"][0]["status"] = "interrupted"
+            workflow.atomic_json(single_checkpoint, single_state)
         emit_progress("cancelled", "done")
         print("\nConversion interrupted.", file=sys.stderr)
         return 130
     except (TranscodeError, OSError, json.JSONDecodeError) as exc:
+        if single_checkpoint and single_state:
+            single_state["entries"][0].update(status="failed", error=str(exc))
+            workflow.atomic_json(single_checkpoint, single_state)
         emit_progress("error", "done", str(exc))
         print(f"Error: {exc}", file=sys.stderr)
         return 2
